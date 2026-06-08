@@ -5718,17 +5718,30 @@ async fn broadcast_tick_task(state: SharedState, tick_ms: u64) {
 // closes that gap by driving the bus from the same broadcast tap the MQTT bridge
 // uses, and surfacing emitted primitives on the WS stream.
 
-/// Map a coarse `motion_level` label (from `raw_classify`) onto the continuous
-/// `motion` scalar the semantic primitives expect (0.0..=1.0). Thresholds mirror
-/// `raw_classify` so a `present_still` frame lands below the elderly-anomaly
-/// "still" gate (motion < 0.02) while `present_moving` clears the room-active
-/// threshold (0.10) and `active` clears it comfortably.
+/// Map a `motion_level` label onto the continuous `motion` scalar the semantic
+/// primitives expect (0.0..=1.0). Thresholds mirror `raw_classify` so a
+/// `present_still` frame lands below the elderly-anomaly "still" gate
+/// (motion < 0.02) while `present_moving` clears the room-active threshold
+/// (0.10) and `active` clears it comfortably.
+///
+/// The canonical label space is the four `raw_classify` buckets, but
+/// `classification.motion_level` can also be overwritten by `adaptive_override`
+/// (a learned classifier whose label set isn't statically guaranteed). So
+/// rather than silently treating an unrecognized non-empty label as *absent*
+/// (0.0) — which, when `presence` is true, would make a moving occupant read as
+/// "still" and could falsely satisfy the inactivity / no-movement / sleeping
+/// gates — an unknown non-empty label defaults to `present_moving`. Only the
+/// explicit absent/empty labels map to 0.0.
 fn motion_level_to_scalar(level: &str) -> f64 {
     match level {
-        "active" => 0.5,
-        "present_moving" => 0.18,
-        "present_still" => 0.01,
-        _ => 0.0, // "absent" or unknown
+        "active" | "walking" | "running" => 0.5,
+        "present_moving" | "moving" => 0.18,
+        "present_still" | "still" => 0.01,
+        "absent" | "none" | "idle" | "" => 0.0,
+        // Unknown (e.g. an adaptive-classifier label we don't model): the
+        // classifier said *something* non-absent, so bias toward "present and
+        // moving" rather than zeroing motion and faking stillness.
+        _ => 0.18,
     }
 }
 
@@ -5831,8 +5844,10 @@ async fn semantic_tick_task(state: SharedState, tick_ms: u64) {
     let mut bus = SemanticBus::new(PrimitiveConfig::default());
     let started = std::time::Instant::now();
     // The primitives debounce on `since_start`; a ~1 Hz cadence is plenty and
-    // keeps the bus cheap regardless of the (faster) sensing tick.
-    let mut interval = tokio::time::interval(Duration::from_millis(tick_ms.clamp(200, 1000)));
+    // keeps the bus cheap regardless of the (faster) sensing tick. Floor at
+    // 1000 ms so the default `--tick-ms=100` doesn't push the semantic stream
+    // to 10× the documented rate (a higher `--tick-ms` can still slow it).
+    let mut interval = tokio::time::interval(Duration::from_millis(tick_ms.max(1000)));
 
     loop {
         interval.tick().await;
@@ -5840,9 +5855,19 @@ async fn semantic_tick_task(state: SharedState, tick_ms: u64) {
 
         let snap = {
             let s = state.read().await;
-            s.latest_update
-                .as_ref()
-                .map(|u| build_semantic_snapshot(u, started.elapsed(), tod))
+            // Don't tick the bus from a frozen `latest_update`: when the ESP32
+            // source goes stale `effective_source()` returns `…:offline` (set
+            // by `broadcast_tick_task`), and re-running the primitives on the
+            // last-seen frame would manufacture false someone_sleeping /
+            // no_movement / inactivity events from data that stopped arriving.
+            // Skip until fresh data resumes.
+            if s.effective_source().ends_with(":offline") {
+                None
+            } else {
+                s.latest_update
+                    .as_ref()
+                    .map(|u| build_semantic_snapshot(u, started.elapsed(), tod))
+            }
         };
         let Some(snap) = snap else { continue };
 
@@ -5917,11 +5942,19 @@ mod semantic_wiring_tests {
     fn motion_level_scalar_respects_primitive_gates() {
         // "present_still" must read as "still" to the elderly-anomaly gate (<0.02)
         assert!(motion_level_to_scalar("present_still") < 0.02);
+        assert!(motion_level_to_scalar("still") < 0.02);
         // "present_moving" must clear the room-active threshold (0.10)
         assert!(motion_level_to_scalar("present_moving") > 0.10);
         assert!(motion_level_to_scalar("active") > 0.10);
+        assert!(motion_level_to_scalar("walking") > 0.10);
+        // Only explicit absent/empty labels zero out motion.
         assert_eq!(motion_level_to_scalar("absent"), 0.0);
-        assert_eq!(motion_level_to_scalar("garbage"), 0.0);
+        assert_eq!(motion_level_to_scalar("none"), 0.0);
+        assert_eq!(motion_level_to_scalar(""), 0.0);
+        // An unknown non-empty label (e.g. an adaptive-classifier label we don't
+        // model) must NOT read as still — it biases to "moving" so a present,
+        // moving occupant can't falsely satisfy the inactivity/no-movement gates.
+        assert!(motion_level_to_scalar("garbage") > 0.10);
     }
 
     #[test]
