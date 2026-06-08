@@ -37,6 +37,20 @@ impl ElderlyInactivityAnomaly {
         Self { longest_idle: BASELINE_FLOOR, ..Default::default() }
     }
 
+    /// The learned inactivity baseline (longest idle stretch observed). The
+    /// anomaly fires at `multiple ×` this, so it must survive restarts —
+    /// otherwise a reboot resets it to the 30-min floor and the gate mis-fires
+    /// for hours. Persisted via `SemanticBus::snapshot`.
+    pub fn baseline(&self) -> Duration {
+        self.longest_idle
+    }
+
+    /// Restore a persisted baseline, floored at the safety minimum so a stale
+    /// or corrupt value can never make the anomaly fire too eagerly.
+    pub fn set_baseline(&mut self, d: Duration) {
+        self.longest_idle = d.max(BASELINE_FLOOR);
+    }
+
     pub fn tick(&mut self, snap: &RawSnapshot, cfg: &PrimitiveConfig) -> PrimitiveState {
         if snap.since_start < cfg.warmup {
             return PrimitiveState::Idle;

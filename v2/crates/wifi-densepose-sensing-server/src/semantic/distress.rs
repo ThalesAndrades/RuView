@@ -58,6 +58,20 @@ impl Default for PossibleDistress {
 impl PossibleDistress {
     pub fn new() -> Self { Self::default() }
 
+    /// The learned rolling heart-rate baseline, if seeded. Persisted across
+    /// restarts so a reboot doesn't relearn the resident's resting HR from
+    /// scratch (which would distort the distress multiple for minutes).
+    pub fn hr_baseline(&self) -> Option<f64> {
+        self.baseline.value
+    }
+
+    /// Restore a persisted HR baseline (ignored if not a positive finite value).
+    pub fn set_hr_baseline(&mut self, v: f64) {
+        if v.is_finite() && v > 0.0 {
+            self.baseline.value = Some(v);
+        }
+    }
+
     pub fn tick(&mut self, snap: &RawSnapshot, cfg: &PrimitiveConfig) -> PrimitiveState {
         if snap.since_start < cfg.warmup {
             // Still seed the baseline even in warmup so we don't fire
