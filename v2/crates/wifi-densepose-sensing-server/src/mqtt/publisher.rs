@@ -36,7 +36,7 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use super::config::{MqttConfig, TlsConfig};
-use super::discovery::{DiscoveryBuilder, EntityKind};
+use super::discovery::{DiscoveryBuilder, DiscoveryComponent, EntityKind};
 use super::state::{RateLimiter, StateEncoder, StateMessage, VitalsSnapshot};
 use crate::semantic::{PrimitiveState, SemanticEvent, SemanticKind};
 
@@ -262,23 +262,12 @@ async fn run(
                 match recv {
                     Ok(snap) => {
                         let elapsed = start_instant.elapsed();
-                        // #898: on first sight of a node_id, publish that
-                        // node's discovery + availability; then route its
-                        // state to per-node topics.
-                        if !nodes.contains_key(&snap.node_id) {
-                            let nb = builder_owned.for_node(&snap.node_id);
-                            let borrowed = nb.as_borrowed();
-                            if let Err(e) =
-                                publish_all_discovery(&client, &borrowed, &entities).await
-                            {
-                                warn!("[mqtt] node {} discovery failed: {e}", snap.node_id);
-                            }
-                            let na = NodeAvailability::for_builder(&borrowed, &entities);
-                            if let Err(e) = publish_availability(&client, &na, "online").await {
-                                warn!("[mqtt] node {} availability failed: {e}", snap.node_id);
-                            }
-                            nodes.insert(snap.node_id.clone(), (nb, na));
-                        }
+                        // #898: on first sight of a node_id, publish that node's
+                        // discovery + availability; then route its state to
+                        // per-node topics. Shared with the semantic path.
+                        ensure_node_registered(
+                            &client, &mut nodes, builder_owned.for_node(&snap.node_id), &entities,
+                        ).await;
                         let borrowed = nodes[&snap.node_id].0.as_borrowed();
                         publish_snapshot(&client, &borrowed, &snap, &cfg, &mut rate_limiter, elapsed).await;
                     }
@@ -312,17 +301,29 @@ async fn run(
                         ).await;
                         let borrowed = nodes[&builder_owned.node_id].0.as_borrowed();
                         let encoder = StateEncoder { builder: &borrowed };
-                        let msg = match &ev.state {
-                            PrimitiveState::Boolean { active, .. } => {
+                        // Match the primitive's value variant against the
+                        // entity's HA component. A mismatch (e.g. a Boolean
+                        // state on a Sensor entity) means the bus→entity
+                        // contract drifted upstream — warn rather than drop it
+                        // silently, so the regression is visible.
+                        let msg = match (&ev.state, entity.component()) {
+                            (PrimitiveState::Boolean { active, .. }, DiscoveryComponent::BinarySensor) => {
                                 encoder.boolean(entity, *active)
                             }
-                            PrimitiveState::Scalar { value, .. } => {
+                            (PrimitiveState::Scalar { value, .. }, DiscoveryComponent::Sensor) => {
                                 encoder.scalar(entity, *value, ev.timestamp_ms)
                             }
-                            PrimitiveState::Event { event_type, .. } => {
+                            (PrimitiveState::Event { event_type, .. }, DiscoveryComponent::Event) => {
                                 encoder.event(entity, *event_type, ev.timestamp_ms, None)
                             }
-                            PrimitiveState::Idle => None,
+                            (PrimitiveState::Idle, _) => None,
+                            _ => {
+                                warn!(
+                                    "[mqtt] semantic kind/state mismatch: {:?} state on {:?} ({:?}) — dropped",
+                                    ev.kind, entity, entity.component()
+                                );
+                                None
+                            }
                         };
                         if let Some(m) = msg {
                             let _ = publish_state(&client, &m).await;

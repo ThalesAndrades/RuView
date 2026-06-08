@@ -5881,19 +5881,23 @@ async fn semantic_tick_task(
         }
 
         let s = state.read().await;
-        if s.tx.receiver_count() == 0 {
-            continue;
-        }
+        // Guard ONLY the WS JSON path on having WS subscribers — the MQTT path
+        // must always run. An HA-only pilot (MQTT publisher, no browser WS
+        // dashboard) has zero WS receivers, so an early `continue` here would
+        // silently drop every semantic event from MQTT/Home Assistant.
+        let has_ws_receivers = s.tx.receiver_count() > 0;
         for ev in &events {
             debug!(
                 "semantic: {} fired ({:?})",
                 semantic_kind_str(ev.kind),
                 ev.state
             );
-            if let Ok(json) = serde_json::to_string(&semantic_event_to_json(ev)) {
-                let _ = s.tx.send(json);
+            if has_ws_receivers {
+                if let Ok(json) = serde_json::to_string(&semantic_event_to_json(ev)) {
+                    let _ = s.tx.send(json);
+                }
             }
-            // Also hand the typed event to the MQTT publisher (no-op when there
+            // Always hand the typed event to the MQTT publisher (no-op when there
             // are no subscribers, e.g. `--mqtt` off or built without the feature).
             let _ = semantic_tx.send(ev.clone());
         }
