@@ -45,6 +45,9 @@ use wifi_densepose_sensing_server::mqtt::{
     publisher::{spawn, OwnedDiscoveryBuilder},
     state::VitalsSnapshot,
 };
+use wifi_densepose_sensing_server::semantic::{
+    PrimitiveState, Reason, SemanticEvent, SemanticKind,
+};
 
 fn should_run() -> Option<u16> {
     if std::env::var("RUVIEW_RUN_INTEGRATION").is_err() {
@@ -172,7 +175,10 @@ async fn discovery_topics_appear_on_broker() {
     let cfg = make_cfg(port, false, "discovery");
     let builder = make_builder("inttest1");
     let (tx, rx) = broadcast::channel::<VitalsSnapshot>(32);
-    let _handle = spawn(cfg, builder, rx);
+    // Semantic events aren't exercised by this vitals test; pass an idle
+    // receiver (the publisher tolerates a quiet/closed semantic channel).
+    let (_sem_tx, sem_rx) = broadcast::channel::<SemanticEvent>(8);
+    let _handle = spawn(cfg, builder, rx, sem_rx);
 
     // #898: discovery is now published per-node the first time a snapshot for
     // that node_id arrives (not eagerly at startup). Drive snapshots for
@@ -238,7 +244,10 @@ async fn privacy_mode_suppresses_biometric_discovery() {
     let cfg = make_cfg(port, /* privacy_mode = */ true, "privacy");
     let builder = make_builder("inttest2");
     let (tx, rx) = broadcast::channel::<VitalsSnapshot>(32);
-    let _handle = spawn(cfg, builder, rx);
+    // Semantic events aren't exercised by this vitals test; pass an idle
+    // receiver (the publisher tolerates a quiet/closed semantic channel).
+    let (_sem_tx, sem_rx) = broadcast::channel::<SemanticEvent>(8);
+    let _handle = spawn(cfg, builder, rx, sem_rx);
 
     // #898: per-node discovery is triggered by a snapshot for that node_id.
     let tx_bg = tx.clone();
@@ -301,7 +310,10 @@ async fn state_messages_published_on_snapshot_broadcast() {
     let cfg = make_cfg(port, false, "state");
     let builder = make_builder("inttest3");
     let (tx, rx) = broadcast::channel::<VitalsSnapshot>(32);
-    let _handle = spawn(cfg, builder, rx);
+    // Semantic events aren't exercised by this vitals test; pass an idle
+    // receiver (the publisher tolerates a quiet/closed semantic channel).
+    let (_sem_tx, sem_rx) = broadcast::channel::<SemanticEvent>(8);
+    let _handle = spawn(cfg, builder, rx, sem_rx);
 
     // Iter 46 — instead of front-loading 6 snapshots and hoping the
     // publisher's startup beats them, drive snapshots in a background
@@ -375,4 +387,56 @@ async fn state_messages_published_on_snapshot_broadcast() {
         "expected OFF state, got {:?}",
         presence_states
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn semantic_event_publishes_state_to_broker() {
+    // End-to-end guard for the ADR-115 §3.12 semantic→MQTT path: a
+    // `SemanticEvent` fed to the publisher must surface as the matching HA
+    // entity's discovery + state on the broker.
+    let Some(port) = should_run() else { return; };
+
+    let (sub, mut sub_loop) = subscribe_client(port, &["homeassistant/#"]).await;
+
+    let cfg = make_cfg(port, false, "semantic");
+    let builder = make_builder("inttest5");
+    let (_tx, rx) = broadcast::channel::<VitalsSnapshot>(32);
+    let (sem_tx, sem_rx) = broadcast::channel::<SemanticEvent>(8);
+    let _handle = spawn(cfg, builder, rx, sem_rx);
+
+    // Drive a `no_movement` ON event throughout the window (a flagship
+    // zone-free safety primitive — boolean problem sensor).
+    let sem_bg = sem_tx.clone();
+    let drive = tokio::spawn(async move {
+        for _ in 0..60 {
+            let _ = sem_bg.send(SemanticEvent {
+                kind: SemanticKind::NoMovement,
+                state: PrimitiveState::Boolean {
+                    active: true,
+                    changed: true,
+                    reason: Reason::new(&["motion<5%", "dwell>30m"]),
+                },
+                node_id: "aggregate".into(),
+                timestamp_ms: 1_779_512_400_000,
+            });
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    });
+
+    let msgs = collect_published(&mut sub_loop, Duration::from_secs(6)).await;
+    drive.abort();
+    let _ = sub.disconnect().await;
+
+    // Discovery config for the semantic entity must appear under the device.
+    let has_cfg = msgs
+        .iter()
+        .any(|(t, _, _)| t.ends_with("/wifi_densepose_inttest5/no_movement/config"));
+    assert!(has_cfg, "no_movement discovery config missing: {:?}",
+        msgs.iter().map(|(t, _, _)| t).collect::<Vec<_>>());
+
+    // ...and its state must be published as ON.
+    let on_state = msgs.iter().any(|(t, p, _)| {
+        t.ends_with("/wifi_densepose_inttest5/no_movement/state") && p == b"ON"
+    });
+    assert!(on_state, "no_movement ON state not published to broker");
 }

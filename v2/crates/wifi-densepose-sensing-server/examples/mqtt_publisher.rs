@@ -106,10 +106,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    these in main.rs (the one the WebSocket handler subscribes to).
     //    We mirror it here.
     let (tx, rx) = broadcast::channel::<VitalsSnapshot>(256);
+    // ADR-115 §3.12: the publisher also accepts a semantic-event stream. This
+    // demo only sends vitals, so the semantic channel stays idle.
+    let (_sem_tx, sem_rx) =
+        broadcast::channel::<wifi_densepose_sensing_server::semantic::SemanticEvent>(16);
 
     // 4. Spawn the publisher. It returns a JoinHandle the caller can
     //    await on shutdown.
-    let publisher = spawn(cfg.clone(), builder, rx);
+    let publisher = spawn(cfg.clone(), builder, rx, sem_rx);
     info!("publisher spawned, sending demo snapshots every 500ms");
 
     // 5. Demo loop — produce a fresh VitalsSnapshot every 500ms with

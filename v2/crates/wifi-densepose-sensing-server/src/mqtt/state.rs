@@ -195,6 +195,15 @@ struct FallEventPayload {
     confidence: Option<f64>,
 }
 
+/// Generic scalar sensor payload. Matches the `{{ value_json.score }}`
+/// template the discovery builder advertises for score-style sensors
+/// (e.g. `fall_risk_elevated`, 0–100).
+#[derive(Serialize)]
+struct ScoreStatePayload {
+    score: f64,
+    ts: String,
+}
+
 /// Encoder bundle that knows how to render each entity's state payload
 /// from a [`VitalsSnapshot`]. Operates on an existing [`DiscoveryBuilder`]
 /// so topics are guaranteed to match what was advertised at discovery
@@ -294,6 +303,28 @@ impl<'a> StateEncoder<'a> {
         );
         Some(StateMessage::new(topic, payload, DiscoveryComponent::Event, false))
     }
+
+    /// Generic scalar-sensor encoder. Renders `{ "score": <value>, "ts": … }`
+    /// for any `Sensor`-component entity whose discovery template reads
+    /// `value_json.score` (the semantic `fall_risk_elevated` 0–100 score).
+    pub fn scalar(&self, entity: EntityKind, value: f64, ts_ms: i64) -> Option<StateMessage> {
+        if !matches!(entity.component(), DiscoveryComponent::Sensor) {
+            return None;
+        }
+        let payload = serde_json::to_string(&ScoreStatePayload {
+            score: value,
+            ts: iso_ts(ts_ms),
+        })
+        .ok()?;
+        let topic = format!(
+            "{}/{}/wifi_densepose_{}/{}/state",
+            self.builder.discovery_prefix,
+            entity.component().as_str(),
+            self.builder.node_id,
+            entity.topic_slug(),
+        );
+        Some(StateMessage::new(topic, payload, DiscoveryComponent::Sensor, false))
+    }
 }
 
 fn iso_ts(ms: i64) -> String {
@@ -308,233 +339,5 @@ fn iso_ts(ms: i64) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::mqtt::discovery::DiscoveryBuilder;
-
-    fn builder() -> DiscoveryBuilder<'static> {
-        DiscoveryBuilder {
-            discovery_prefix: "homeassistant",
-            node_id: "aabbccddeeff",
-            node_friendly_name: Some("Bedroom"),
-            sw_version: "v0.7.0",
-            model: "ESP32-S3 CSI node",
-            via_device: None,
-        }
-    }
-
-    fn rates() -> PublishRates {
-        PublishRates {
-            vitals_hz: 0.2,
-            motion_hz: 1.0,
-            count_hz: 1.0,
-            rssi_hz: 0.1,
-            pose_hz: 1.0,
-        }
-    }
-
-    fn snap() -> VitalsSnapshot {
-        VitalsSnapshot {
-            node_id: "aabbccddeeff".into(),
-            timestamp_ms: 1779_512_400_000,
-            presence: true,
-            fall_detected: false,
-            motion: 0.35,
-            motion_energy: 1234.5,
-            presence_score: 0.91,
-            breathing_rate_bpm: Some(14.2),
-            heartrate_bpm: Some(68.2),
-            n_persons: 1,
-            rssi_dbm: Some(-52.0),
-            vital_confidence: 0.87,
-        }
-    }
-
-    // ─── Rate limiter ────────────────────────────────────────────────
-
-    #[test]
-    fn rate_limiter_first_sample_always_passes() {
-        let mut rl = RateLimiter::new();
-        assert!(rl.allow(EntityKind::HeartRate, Duration::ZERO, &rates()));
-    }
-
-    #[test]
-    fn rate_limiter_drops_within_gap() {
-        let mut rl = RateLimiter::new();
-        let r = rates();
-        // 0.2 Hz → 5 s gap.
-        assert!(rl.allow(EntityKind::HeartRate, Duration::from_secs(0), &r));
-        assert!(!rl.allow(EntityKind::HeartRate, Duration::from_secs(1), &r));
-        assert!(!rl.allow(EntityKind::HeartRate, Duration::from_secs(4), &r));
-    }
-
-    #[test]
-    fn rate_limiter_allows_after_gap() {
-        let mut rl = RateLimiter::new();
-        let r = rates();
-        assert!(rl.allow(EntityKind::HeartRate, Duration::from_secs(0), &r));
-        // 5 s gap met → allow.
-        assert!(rl.allow(EntityKind::HeartRate, Duration::from_secs(5), &r));
-    }
-
-    #[test]
-    fn rate_limiter_per_entity_independent() {
-        let mut rl = RateLimiter::new();
-        let r = rates();
-        assert!(rl.allow(EntityKind::HeartRate, Duration::from_secs(0), &r));
-        // Different entity, same instant → independent budget.
-        assert!(rl.allow(EntityKind::MotionLevel, Duration::from_secs(0), &r));
-    }
-
-    #[test]
-    fn rate_limiter_change_only_entities_always_allow() {
-        let mut rl = RateLimiter::new();
-        let r = rates();
-        // Presence is change-only → rate=0 → unlimited; caller does change detection.
-        for s in 0..3 {
-            assert!(rl.allow(EntityKind::Presence, Duration::from_secs(s), &r));
-        }
-    }
-
-    #[test]
-    fn rate_limiter_reset_re_enables_immediate_publish() {
-        let mut rl = RateLimiter::new();
-        let r = rates();
-        assert!(rl.allow(EntityKind::HeartRate, Duration::from_secs(0), &r));
-        assert!(!rl.allow(EntityKind::HeartRate, Duration::from_secs(1), &r));
-        rl.reset();
-        // Post-reset: first sample passes.
-        assert!(rl.allow(EntityKind::HeartRate, Duration::from_secs(1), &r));
-    }
-
-    // ─── Boolean / binary_sensor encoder ─────────────────────────────
-
-    #[test]
-    fn boolean_encoder_emits_on_off_payload() {
-        let b = builder();
-        let enc = StateEncoder { builder: &b };
-        let on = enc.boolean(EntityKind::Presence, true).unwrap();
-        assert_eq!(on.payload, "ON");
-        assert_eq!(on.qos, 1);
-        assert!(on.retain, "binary_sensor state must be retained per §3.5");
-        let off = enc.boolean(EntityKind::Presence, false).unwrap();
-        assert_eq!(off.payload, "OFF");
-    }
-
-    #[test]
-    fn boolean_encoder_rejects_non_binary_entities() {
-        let b = builder();
-        let enc = StateEncoder { builder: &b };
-        assert!(enc.boolean(EntityKind::HeartRate, true).is_none());
-        assert!(enc.boolean(EntityKind::FallDetected, true).is_none());
-    }
-
-    #[test]
-    fn boolean_topic_matches_discovery_state_topic() {
-        let b = builder();
-        let enc = StateEncoder { builder: &b };
-        let msg = enc.boolean(EntityKind::Presence, true).unwrap();
-        assert_eq!(
-            msg.topic,
-            "homeassistant/binary_sensor/wifi_densepose_aabbccddeeff/presence/state"
-        );
-    }
-
-    // ─── Numeric / sensor encoder ────────────────────────────────────
-
-    #[test]
-    fn numeric_encoder_emits_bpm_payload_for_heart_rate() {
-        let b = builder();
-        let enc = StateEncoder { builder: &b };
-        let s = snap();
-        let msg = enc.numeric(EntityKind::HeartRate, &s).unwrap();
-        let json: serde_json::Value = serde_json::from_str(&msg.payload).unwrap();
-        assert_eq!(json["bpm"], 68.2);
-        assert_eq!(json["confidence"], 0.87);
-        assert_eq!(msg.qos, 0, "sensor state is QoS 0 per §3.5");
-        assert!(!msg.retain);
-    }
-
-    #[test]
-    fn numeric_encoder_emits_motion_percent_payload() {
-        let b = builder();
-        let enc = StateEncoder { builder: &b };
-        let s = snap();
-        let msg = enc.numeric(EntityKind::MotionLevel, &s).unwrap();
-        let json: serde_json::Value = serde_json::from_str(&msg.payload).unwrap();
-        // 0.35 → 35.0%
-        assert_eq!(json["level_pct"], 35.0);
-    }
-
-    #[test]
-    fn numeric_encoder_returns_none_when_optional_field_missing() {
-        let b = builder();
-        let enc = StateEncoder { builder: &b };
-        let mut s = snap();
-        s.heartrate_bpm = None;
-        assert!(enc.numeric(EntityKind::HeartRate, &s).is_none());
-    }
-
-    #[test]
-    fn numeric_encoder_clamps_out_of_range_motion() {
-        let b = builder();
-        let enc = StateEncoder { builder: &b };
-        let mut s = snap();
-        s.motion = 1.7; // pathological — clamp to 1.0 then ×100.
-        let msg = enc.numeric(EntityKind::MotionLevel, &s).unwrap();
-        let json: serde_json::Value = serde_json::from_str(&msg.payload).unwrap();
-        assert_eq!(json["level_pct"], 100.0);
-    }
-
-    #[test]
-    fn numeric_encoder_rejects_non_sensor_entities() {
-        let b = builder();
-        let enc = StateEncoder { builder: &b };
-        let s = snap();
-        assert!(enc.numeric(EntityKind::Presence, &s).is_none());
-        assert!(enc.numeric(EntityKind::FallDetected, &s).is_none());
-    }
-
-    // ─── Event encoder ───────────────────────────────────────────────
-
-    #[test]
-    fn event_encoder_emits_fall_payload() {
-        let b = builder();
-        let enc = StateEncoder { builder: &b };
-        let msg = enc
-            .event(EntityKind::FallDetected, "fall_detected", 1779_512_400_000, Some(0.87))
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_str(&msg.payload).unwrap();
-        assert_eq!(json["event_type"], "fall_detected");
-        assert_eq!(json["confidence"], 0.87);
-        assert_eq!(msg.qos, 1);
-        assert!(!msg.retain, "events must never be retained — HA would replay old falls");
-    }
-
-    #[test]
-    fn event_encoder_omits_confidence_when_absent() {
-        let b = builder();
-        let enc = StateEncoder { builder: &b };
-        let msg = enc
-            .event(EntityKind::BedExit, "bed_exit", 1779_512_400_000, None)
-            .unwrap();
-        assert!(!msg.payload.contains("confidence"));
-    }
-
-    #[test]
-    fn event_encoder_rejects_non_event_entities() {
-        let b = builder();
-        let enc = StateEncoder { builder: &b };
-        assert!(enc.event(EntityKind::Presence, "x", 0, None).is_none());
-        assert!(enc.event(EntityKind::HeartRate, "x", 0, None).is_none());
-    }
-
-    #[test]
-    fn iso_ts_is_rfc3339_utc_with_millis() {
-        let ts = iso_ts(1779_512_400_000);
-        assert!(ts.ends_with("Z"));
-        assert!(ts.contains("T"));
-        // .000 suffix from `SecondsFormat::Millis`.
-        assert!(ts.contains("."), "want millisecond fraction in: {}", ts);
-    }
-}
+#[path = "state_tests.rs"]
+mod tests;
