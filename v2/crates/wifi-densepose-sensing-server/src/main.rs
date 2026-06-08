@@ -23,6 +23,11 @@ mod vital_signs;
 
 // Training pipeline modules (exposed via lib.rs)
 use wifi_densepose_sensing_server::{dataset, embedding, graph_transformer, trainer};
+// ADR-115 §3.12 — semantic inference bus (HA-MIND). Drives the 10 primitive
+// FSMs from the live sensing broadcast. See `semantic_tick_task`.
+use wifi_densepose_sensing_server::semantic::{
+    PrimitiveConfig, PrimitiveState, RawSnapshot, SemanticBus, SemanticEvent, SemanticKind,
+};
 
 use ruvector_mincut::{DynamicMinCut, MinCutBuilder};
 use std::collections::{HashMap, VecDeque};
@@ -88,6 +93,12 @@ struct Args {
     /// Tick interval in milliseconds (default 100 ms = 10 fps for smooth pose animation)
     #[arg(long, default_value = "100")]
     tick_ms: u64,
+
+    /// Enable the ADR-115 §3.12 semantic inference bus (HA-MIND primitives).
+    /// Default on — the primitives are the primary product surface. Pass
+    /// `--semantic false` to disable (e.g. raw-signal-only deployments).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    semantic: bool,
 
     /// Bind address (default 127.0.0.1; set to 0.0.0.0 for network access)
     #[arg(long, default_value = "127.0.0.1", env = "SENSING_BIND_ADDR")]
@@ -5696,6 +5707,324 @@ async fn broadcast_tick_task(state: SharedState, tick_ms: u64) {
     }
 }
 
+// ── ADR-115 §3.12 — Semantic inference bus wiring ─────────────────────────────
+//
+// Background: the `semantic::SemanticBus` (10 primitive FSMs: someone_sleeping,
+// possible_distress, room_active, elderly_inactivity_anomaly, meeting,
+// bathroom_occupied, fall_risk, bed_exit, no_movement, multi_room) was fully
+// implemented and unit-tested, but constructed **only in tests** — `main` never
+// instantiated or ticked it. So the advertised "primary product surface"
+// (`--semantic`, default on) produced nothing at runtime. `semantic_tick_task`
+// closes that gap by driving the bus from the same broadcast tap the MQTT bridge
+// uses, and surfacing emitted primitives on the WS stream.
+
+/// Map a `motion_level` label onto the continuous `motion` scalar the semantic
+/// primitives expect (0.0..=1.0). Thresholds mirror `raw_classify` so a
+/// `present_still` frame lands below the elderly-anomaly "still" gate
+/// (motion < 0.02) while `present_moving` clears the room-active threshold
+/// (0.10) and `active` clears it comfortably.
+///
+/// The canonical label space is the four `raw_classify` buckets, but
+/// `classification.motion_level` can also be overwritten by `adaptive_override`
+/// (a learned classifier whose label set isn't statically guaranteed). So
+/// rather than silently treating an unrecognized non-empty label as *absent*
+/// (0.0) — which, when `presence` is true, would make a moving occupant read as
+/// "still" and could falsely satisfy the inactivity / no-movement / sleeping
+/// gates — an unknown non-empty label defaults to `present_moving`. Only the
+/// explicit absent/empty labels map to 0.0.
+fn motion_level_to_scalar(level: &str) -> f64 {
+    match level {
+        "active" | "walking" | "running" => 0.5,
+        "present_moving" | "moving" => 0.18,
+        "present_still" | "still" => 0.01,
+        "absent" | "none" | "idle" | "" => 0.0,
+        // Unknown (e.g. an adaptive-classifier label we don't model): the
+        // classifier said *something* non-absent, so bias toward "present and
+        // moving" rather than zeroing motion and faking stillness.
+        _ => 0.18,
+    }
+}
+
+/// Project the live `SensingUpdate` broadcast onto a `RawSnapshot` for the
+/// semantic bus.
+///
+/// Zones are intentionally empty: the node→zone model (ADR-115 §3.12,
+/// `--semantic-zones-file`) is unresolved, so the three zone-gated primitives
+/// (bed_exit, bathroom, multi_room) stay dormant — their documented, tested
+/// behavior when zones are unconfigured. The seven zone-free primitives run
+/// fully. Routing events to MQTT/Matter entities + the zone model are the
+/// tracked follow-up.
+fn build_semantic_snapshot(
+    update: &SensingUpdate,
+    since_start: Duration,
+    local_seconds_since_midnight: u32,
+) -> RawSnapshot {
+    let vitals = update.vital_signs.as_ref();
+    let presence = update.classification.presence;
+    RawSnapshot {
+        node_id: "aggregate".to_string(),
+        since_start,
+        timestamp_ms: (update.timestamp * 1000.0) as i64,
+        presence,
+        fall_detected: false, // fall path deferred (out of zone-free bus scope)
+        motion: motion_level_to_scalar(&update.classification.motion_level),
+        motion_energy: update.features.motion_band_power,
+        breathing_rate_bpm: vitals.and_then(|v| v.breathing_rate_bpm),
+        heart_rate_bpm: vitals.and_then(|v| v.heart_rate_bpm),
+        n_persons: update
+            .estimated_persons
+            .unwrap_or(if presence { 1 } else { 0 }) as u32,
+        rssi_dbm: Some(update.features.mean_rssi),
+        vital_confidence: vitals
+            .map(|v| v.signal_quality)
+            .unwrap_or(update.classification.confidence),
+        active_zones: Vec::new(),
+        bed_zones: Vec::new(),
+        local_seconds_since_midnight,
+    }
+}
+
+/// Stable wire name for each primitive (matches the HA entity slugs in
+/// ADR-115 §3.12).
+fn semantic_kind_str(kind: SemanticKind) -> &'static str {
+    match kind {
+        SemanticKind::SomeoneSleeping => "someone_sleeping",
+        SemanticKind::PossibleDistress => "possible_distress",
+        SemanticKind::RoomActive => "room_active",
+        SemanticKind::ElderlyAnomaly => "elderly_inactivity_anomaly",
+        SemanticKind::Meeting => "meeting_in_progress",
+        SemanticKind::BathroomOccupied => "bathroom_occupied",
+        SemanticKind::FallRisk => "fall_risk_elevated",
+        SemanticKind::BedExit => "bed_exit",
+        SemanticKind::NoMovement => "no_movement",
+        SemanticKind::MultiRoom => "multi_room_transition",
+    }
+}
+
+/// Serialize one semantic event into the WS broadcast envelope. The `state`
+/// shape varies by primitive output (boolean / scalar / one-shot event), and
+/// each carries the explainable `reason` tags for HA debugging.
+fn semantic_event_to_json(ev: &SemanticEvent) -> serde_json::Value {
+    let (state, reason): (serde_json::Value, Vec<String>) = match &ev.state {
+        PrimitiveState::Boolean { active, reason, .. } => (
+            serde_json::json!({ "kind": "boolean", "active": active }),
+            reason.tags.clone(),
+        ),
+        PrimitiveState::Scalar { value, reason } => (
+            serde_json::json!({ "kind": "scalar", "value": value }),
+            reason.tags.clone(),
+        ),
+        PrimitiveState::Event { event_type, reason } => (
+            serde_json::json!({ "kind": "event", "event_type": event_type }),
+            reason.tags.clone(),
+        ),
+        PrimitiveState::Idle => (serde_json::json!({ "kind": "idle" }), Vec::new()),
+    };
+    serde_json::json!({
+        "type": "semantic_event",
+        "primitive": semantic_kind_str(ev.kind),
+        "node_id": ev.node_id,
+        "timestamp_ms": ev.timestamp_ms,
+        "state": state,
+        "reason": reason,
+    })
+}
+
+/// ADR-115 §3.12 — drive the semantic inference bus from the live sensing
+/// broadcast and surface emitted primitives on the WS stream as
+/// `{"type":"semantic_event", ...}` messages.
+///
+/// Reuses the existing `tx` broadcast tap (same one the MQTT bridge and pose
+/// WS clients consume), so this is purely additive — no new routes, no change
+/// to the existing `sensing_update` payload. Event delivery to first-class
+/// MQTT/Matter entities is the tracked follow-up.
+async fn semantic_tick_task(state: SharedState, tick_ms: u64) {
+    use chrono::Timelike;
+
+    let mut bus = SemanticBus::new(PrimitiveConfig::default());
+    let started = std::time::Instant::now();
+    // The primitives debounce on `since_start`; a ~1 Hz cadence is plenty and
+    // keeps the bus cheap regardless of the (faster) sensing tick. Floor at
+    // 1000 ms so the default `--tick-ms=100` doesn't push the semantic stream
+    // to 10× the documented rate (a higher `--tick-ms` can still slow it).
+    let mut interval = tokio::time::interval(Duration::from_millis(tick_ms.max(1000)));
+
+    loop {
+        interval.tick().await;
+        let tod = chrono::Local::now().num_seconds_from_midnight();
+
+        let snap = {
+            let s = state.read().await;
+            // Don't tick the bus from a frozen `latest_update`: when the ESP32
+            // source goes stale `effective_source()` returns `…:offline` (set
+            // by `broadcast_tick_task`), and re-running the primitives on the
+            // last-seen frame would manufacture false someone_sleeping /
+            // no_movement / inactivity events from data that stopped arriving.
+            // Skip until fresh data resumes.
+            if s.effective_source().ends_with(":offline") {
+                None
+            } else {
+                s.latest_update
+                    .as_ref()
+                    .map(|u| build_semantic_snapshot(u, started.elapsed(), tod))
+            }
+        };
+        let Some(snap) = snap else { continue };
+
+        let events = bus.tick(&snap);
+        if events.is_empty() {
+            continue;
+        }
+
+        let s = state.read().await;
+        if s.tx.receiver_count() == 0 {
+            continue;
+        }
+        for ev in &events {
+            debug!(
+                "semantic: {} fired ({:?})",
+                semantic_kind_str(ev.kind),
+                ev.state
+            );
+            if let Ok(json) = serde_json::to_string(&semantic_event_to_json(ev)) {
+                let _ = s.tx.send(json);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod semantic_wiring_tests {
+    use super::*;
+    use wifi_densepose_sensing_server::semantic::Reason;
+
+    fn base_update() -> SensingUpdate {
+        SensingUpdate {
+            msg_type: "sensing_update".into(),
+            timestamp: 1_700_000_000.0,
+            source: "simulate".into(),
+            tick: 1,
+            nodes: Vec::new(),
+            features: FeatureInfo {
+                mean_rssi: -55.0,
+                variance: 0.0,
+                motion_band_power: 0.3,
+                breathing_band_power: 0.0,
+                dominant_freq_hz: 0.0,
+                change_points: 0,
+                spectral_power: 0.0,
+            },
+            classification: ClassificationInfo {
+                motion_level: "absent".into(),
+                presence: false,
+                confidence: 0.5,
+            },
+            signal_field: SignalField {
+                grid_size: [1, 1, 1],
+                values: vec![0.0],
+            },
+            vital_signs: None,
+            enhanced_motion: None,
+            enhanced_breathing: None,
+            posture: None,
+            signal_quality_score: None,
+            quality_verdict: None,
+            bssid_count: None,
+            pose_keypoints: None,
+            model_status: None,
+            persons: None,
+            estimated_persons: None,
+            node_features: None,
+        }
+    }
+
+    #[test]
+    fn motion_level_scalar_respects_primitive_gates() {
+        // "present_still" must read as "still" to the elderly-anomaly gate (<0.02)
+        assert!(motion_level_to_scalar("present_still") < 0.02);
+        assert!(motion_level_to_scalar("still") < 0.02);
+        // "present_moving" must clear the room-active threshold (0.10)
+        assert!(motion_level_to_scalar("present_moving") > 0.10);
+        assert!(motion_level_to_scalar("active") > 0.10);
+        assert!(motion_level_to_scalar("walking") > 0.10);
+        // Only explicit absent/empty labels zero out motion.
+        assert_eq!(motion_level_to_scalar("absent"), 0.0);
+        assert_eq!(motion_level_to_scalar("none"), 0.0);
+        assert_eq!(motion_level_to_scalar(""), 0.0);
+        // An unknown non-empty label (e.g. an adaptive-classifier label we don't
+        // model) must NOT read as still — it biases to "moving" so a present,
+        // moving occupant can't falsely satisfy the inactivity/no-movement gates.
+        assert!(motion_level_to_scalar("garbage") > 0.10);
+    }
+
+    #[test]
+    fn snapshot_maps_presence_motion_and_count() {
+        let mut u = base_update();
+        u.classification.presence = true;
+        u.classification.motion_level = "present_still".into();
+        u.estimated_persons = Some(2);
+        u.vital_signs = Some(VitalSigns {
+            breathing_rate_bpm: Some(14.0),
+            heart_rate_bpm: None,
+            breathing_confidence: 0.8,
+            heartbeat_confidence: 0.0,
+            signal_quality: 0.7,
+        });
+
+        let snap = build_semantic_snapshot(&u, Duration::from_secs(120), 2 * 3600);
+        assert!(snap.presence);
+        assert!(snap.motion < 0.02);
+        assert_eq!(snap.n_persons, 2);
+        assert_eq!(snap.breathing_rate_bpm, Some(14.0));
+        assert!((snap.vital_confidence - 0.7).abs() < 1e-9);
+        // Zones stay empty until the node→zone model lands.
+        assert!(snap.active_zones.is_empty() && snap.bed_zones.is_empty());
+        assert_eq!(snap.local_seconds_since_midnight, 2 * 3600);
+    }
+
+    #[test]
+    fn snapshot_defaults_count_from_presence_when_unspecified() {
+        let mut u = base_update();
+        u.classification.presence = true; // no estimated_persons
+        let snap = build_semantic_snapshot(&u, Duration::from_secs(1), 0);
+        assert_eq!(snap.n_persons, 1);
+
+        u.classification.presence = false;
+        let snap = build_semantic_snapshot(&u, Duration::from_secs(1), 0);
+        assert_eq!(snap.n_persons, 0);
+    }
+
+    #[test]
+    fn event_json_carries_primitive_name_state_and_reason() {
+        let ev = SemanticEvent {
+            kind: SemanticKind::ElderlyAnomaly,
+            state: PrimitiveState::Boolean {
+                active: true,
+                changed: true,
+                reason: Reason::new(&["presence=true", "idle>2x_baseline"]),
+            },
+            node_id: "aggregate".into(),
+            timestamp_ms: 123,
+        };
+        let j = semantic_event_to_json(&ev);
+        assert_eq!(j["type"], "semantic_event");
+        assert_eq!(j["primitive"], "elderly_inactivity_anomaly");
+        assert_eq!(j["state"]["kind"], "boolean");
+        assert_eq!(j["state"]["active"], true);
+        assert_eq!(j["reason"][0], "presence=true");
+        assert_eq!(j["timestamp_ms"], 123);
+    }
+
+    #[test]
+    fn kind_str_is_stable_for_all_primitives() {
+        // Guards against accidental slug drift from the HA entity contract.
+        assert_eq!(semantic_kind_str(SemanticKind::SomeoneSleeping), "someone_sleeping");
+        assert_eq!(semantic_kind_str(SemanticKind::BedExit), "bed_exit");
+        assert_eq!(semantic_kind_str(SemanticKind::NoMovement), "no_movement");
+        assert_eq!(semantic_kind_str(SemanticKind::FallRisk), "fall_risk_elevated");
+    }
+}
+
 /// Map one sensing-broadcast JSON document into the `VitalsSnapshot`(s) to
 /// publish over MQTT (issues #872/#898).
 ///
@@ -6725,6 +7054,14 @@ async fn main() {
         _ => {
             tokio::spawn(simulated_data_task(state.clone(), args.tick_ms));
         }
+    }
+
+    // ADR-115 §3.12 — start the semantic inference bus (default on). Runs
+    // alongside every source so the 10 primitives are driven from the live
+    // broadcast and emitted on the WS stream as `semantic_event` messages.
+    if args.semantic {
+        info!("Semantic inference bus enabled (ADR-115 §3.12) — emitting semantic_event on /ws");
+        tokio::spawn(semantic_tick_task(state.clone(), args.tick_ms));
     }
 
     // ADR-050: Parse bind address once, use for all listeners
