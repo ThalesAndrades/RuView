@@ -414,9 +414,6 @@ struct NodeState {
     debounce_candidate: String,
     baseline_motion: f64,
     baseline_frames: u64,
-    /// Learned empty-room `sm` noise floor (EMA while absent). Drives the
-    /// adaptive presence threshold; 0.0 keeps the proven 0.03 default.
-    presence_noise_floor: f64,
     smoothed_hr: f64,
     smoothed_br: f64,
     smoothed_hr_conf: f64,
@@ -635,7 +632,6 @@ impl NodeState {
             debounce_candidate: "absent".to_string(),
             baseline_motion: 0.0,
             baseline_frames: 0,
-            presence_noise_floor: 0.0,
             smoothed_hr: 0.0,
             smoothed_br: 0.0,
             smoothed_hr_conf: 0.0,
@@ -952,9 +948,6 @@ struct AppStateInner {
     baseline_motion: f64,
     /// Number of frames processed so far (for baseline warm-up).
     baseline_frames: u64,
-    /// Learned empty-room `sm` noise floor (EMA while absent). Drives the
-    /// adaptive presence threshold; 0.0 keeps the proven 0.03 default.
-    presence_noise_floor: f64,
     // ── Vital signs smoothing ────────────────────────────────────────────
     /// EMA-smoothed heart rate (BPM).
     smoothed_hr: f64,
@@ -1913,25 +1906,6 @@ const BASELINE_EMA_ALPHA: f64 = 0.003;
 /// Number of warm-up frames before baseline subtraction kicks in.
 const BASELINE_WARMUP: u64 = 50;
 
-/// Floor for the adaptive presence threshold — the long-proven fixed default.
-/// The adaptive threshold can only ever rise *above* this (to suppress false
-/// presence in an electrically noisy room), never drop below it, so presence
-/// is provably never more trigger-happy than the old hardcoded `0.03`.
-const PRESENCE_THRESHOLD_FLOOR: f64 = 0.03;
-/// Margin the presence threshold sits above the learned empty-room `sm` noise.
-const PRESENCE_NOISE_MARGIN: f64 = 2.5;
-/// Slow EMA for learning the absent-state `sm` noise floor (~minutes), so a
-/// brief disturbance doesn't move the threshold.
-const PRESENCE_NOISE_ALPHA: f64 = 0.002;
-
-/// Adaptive presence threshold: a margin above the learned empty-room noise
-/// floor, clamped to never fall below the proven [`PRESENCE_THRESHOLD_FLOOR`].
-/// In a quiet room the floor governs (identical to the old behavior); in a
-/// noisy room the threshold rises to reject the residual chatter.
-fn adaptive_presence_threshold(noise_floor: f64) -> f64 {
-    PRESENCE_THRESHOLD_FLOOR.max(noise_floor * PRESENCE_NOISE_MARGIN)
-}
-
 /// Apply EMA smoothing, adaptive baseline subtraction, and hysteresis debounce
 /// to the raw classification.  Mutates the smoothing state in `AppStateInner`.
 fn smooth_and_classify(state: &mut AppStateInner, raw: &mut ClassificationInfo, raw_motion: f64) {
@@ -1978,16 +1952,7 @@ fn smooth_and_classify(state: &mut AppStateInner, raw: &mut ClassificationInfo, 
 
     // 6. Write the smoothed result back into the classification.
     raw.motion_level = state.current_motion_level.clone();
-    // Adaptive presence: threshold sits a margin above the learned empty-room
-    // `sm` noise floor (never below the proven 0.03). Learn the floor only
-    // while absent, so a real occupant's motion can never inflate it.
-    let threshold = adaptive_presence_threshold(state.presence_noise_floor);
-    let present = sm > threshold;
-    if !present {
-        state.presence_noise_floor =
-            state.presence_noise_floor * (1.0 - PRESENCE_NOISE_ALPHA) + sm * PRESENCE_NOISE_ALPHA;
-    }
-    raw.presence = present;
+    raw.presence = sm > 0.03;
     raw.confidence = (0.4 + sm * 0.6).clamp(0.0, 1.0);
 }
 
@@ -2025,52 +1990,8 @@ fn smooth_and_classify_node(ns: &mut NodeState, raw: &mut ClassificationInfo, ra
     }
 
     raw.motion_level = ns.current_motion_level.clone();
-    // Adaptive presence (per node) — see `smooth_and_classify`.
-    let threshold = adaptive_presence_threshold(ns.presence_noise_floor);
-    let present = sm > threshold;
-    if !present {
-        ns.presence_noise_floor =
-            ns.presence_noise_floor * (1.0 - PRESENCE_NOISE_ALPHA) + sm * PRESENCE_NOISE_ALPHA;
-    }
-    raw.presence = present;
+    raw.presence = sm > 0.03;
     raw.confidence = (0.4 + sm * 0.6).clamp(0.0, 1.0);
-}
-
-#[cfg(test)]
-mod presence_threshold_tests {
-    use super::*;
-
-    #[test]
-    fn quiet_room_keeps_the_proven_floor() {
-        // No learned noise → exactly the old hardcoded 0.03.
-        assert_eq!(adaptive_presence_threshold(0.0), PRESENCE_THRESHOLD_FLOOR);
-        // A tiny noise floor still rounds under the floor → 0.03.
-        assert_eq!(adaptive_presence_threshold(0.005), PRESENCE_THRESHOLD_FLOOR); // 0.0125 < 0.03
-    }
-
-    #[test]
-    fn noisy_room_raises_the_threshold_above_the_floor() {
-        // Empty-state sm floating at 0.02 → threshold 0.05, never below floor.
-        assert!((adaptive_presence_threshold(0.02) - 0.05).abs() < 1e-9);
-        // The threshold is monotonic in the noise floor and never below 0.03.
-        for nf in [0.0, 0.01, 0.05, 0.2] {
-            assert!(adaptive_presence_threshold(nf) >= PRESENCE_THRESHOLD_FLOOR);
-        }
-    }
-
-    #[test]
-    fn learning_the_floor_converges_and_never_drops_below_floor() {
-        // Replay the absent-state EMA with a noisy empty room (sm≈0.04).
-        let mut nf = 0.0_f64;
-        for _ in 0..5000 {
-            nf = nf * (1.0 - PRESENCE_NOISE_ALPHA) + 0.04 * PRESENCE_NOISE_ALPHA;
-        }
-        assert!((nf - 0.04).abs() < 1e-3, "floor should converge to the noise, got {nf}");
-        // Threshold has risen to suppress that chatter, but a quiet room
-        // (nf=0) is still exactly the old 0.03.
-        assert!(adaptive_presence_threshold(nf) > PRESENCE_THRESHOLD_FLOOR);
-        assert_eq!(adaptive_presence_threshold(0.0), PRESENCE_THRESHOLD_FLOOR);
-    }
 }
 
 /// If an adaptive model is loaded, override the classification with the
@@ -5942,7 +5863,22 @@ async fn semantic_tick_task(
                 snap.elderly_longest_idle_secs, snap.distress_hr_baseline
             );
         }
-        Err(_) => info!("No persisted semantic baselines yet (cold start)"),
+        Err(err) => {
+            // Only a missing file is a genuine cold start. A corrupt JSON or a
+            // permission/I/O error must NOT silently disable persistence (which
+            // would relearn from scratch every restart) — surface it.
+            if err
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+            {
+                info!("No persisted semantic baselines yet (cold start)");
+            } else {
+                warn!(
+                    "Failed to restore semantic baselines from {}: {err}; starting cold",
+                    data_dir.display()
+                );
+            }
+        }
     }
     let mut last_save = std::time::Instant::now();
 
@@ -7104,7 +7040,6 @@ async fn main() {
         debounce_candidate: "absent".to_string(),
         baseline_motion: 0.0,
         baseline_frames: 0,
-        presence_noise_floor: 0.0,
         smoothed_hr: 0.0,
         smoothed_br: 0.0,
         smoothed_hr_conf: 0.0,
