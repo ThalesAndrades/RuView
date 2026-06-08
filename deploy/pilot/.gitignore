@@ -1,0 +1,7 @@
+# Operator-local pilot files — never commit secrets or runtime state.
+.env
+zones.json
+passwd
+mosquitto/data/
+mosquitto/log/
+models/
