@@ -58,6 +58,12 @@ impl ZoneMap {
     }
 
     /// Load + parse from a file path.
+    ///
+    /// This is a plain file read: the caller owns path trust. The only caller,
+    /// the `--semantic-zones-file` CLI handler in `main.rs`, sanitizes the
+    /// operator-supplied path (rejects `..` traversal, requires a regular file)
+    /// at the trust boundary before calling this. No allowlist base is enforced
+    /// here so the loader stays reusable for absolute operator paths.
     pub fn from_file(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let raw = std::fs::read_to_string(path)?;
         Ok(Self::from_json_str(&raw)?)

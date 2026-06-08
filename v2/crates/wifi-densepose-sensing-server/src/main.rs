@@ -7211,6 +7211,27 @@ async fn main() {
         // A bad file is logged and ignored (the 7 zone-free primitives still
         // run) rather than failing startup.
         let zones = args.semantic_zones_file.as_ref().and_then(|p| {
+            // Defensive path hygiene at the CLI trust boundary (repo guideline
+            // "sanitize file paths"). The operator already has process
+            // privileges, so this isn't a privilege boundary — but rejecting
+            // `..` traversal and non-files keeps the input well-formed and the
+            // failure mode explicit. No allowlist base: an operator may
+            // legitimately point at an absolute config path (e.g.
+            // /etc/ruview/zones.json), so `ZoneMap::from_file` stays general.
+            if p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                warn!(
+                    "Rejected --semantic-zones-file {}: parent-directory ('..') traversal is not allowed",
+                    p.display()
+                );
+                return None;
+            }
+            if !p.is_file() {
+                warn!(
+                    "--semantic-zones-file {} is not a readable file; zone-gated primitives stay dormant",
+                    p.display()
+                );
+                return None;
+            }
             match ZoneMap::from_file(p) {
                 Ok(zm) => {
                     info!(
