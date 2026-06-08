@@ -195,6 +195,15 @@ struct FallEventPayload {
     confidence: Option<f64>,
 }
 
+/// Generic scalar sensor payload. Matches the `{{ value_json.score }}`
+/// template the discovery builder advertises for score-style sensors
+/// (e.g. `fall_risk_elevated`, 0–100).
+#[derive(Serialize)]
+struct ScoreStatePayload {
+    score: f64,
+    ts: String,
+}
+
 /// Encoder bundle that knows how to render each entity's state payload
 /// from a [`VitalsSnapshot`]. Operates on an existing [`DiscoveryBuilder`]
 /// so topics are guaranteed to match what was advertised at discovery
@@ -294,6 +303,28 @@ impl<'a> StateEncoder<'a> {
         );
         Some(StateMessage::new(topic, payload, DiscoveryComponent::Event, false))
     }
+
+    /// Generic scalar-sensor encoder. Renders `{ "score": <value>, "ts": … }`
+    /// for any `Sensor`-component entity whose discovery template reads
+    /// `value_json.score` (the semantic `fall_risk_elevated` 0–100 score).
+    pub fn scalar(&self, entity: EntityKind, value: f64, ts_ms: i64) -> Option<StateMessage> {
+        if !matches!(entity.component(), DiscoveryComponent::Sensor) {
+            return None;
+        }
+        let payload = serde_json::to_string(&ScoreStatePayload {
+            score: value,
+            ts: iso_ts(ts_ms),
+        })
+        .ok()?;
+        let topic = format!(
+            "{}/{}/wifi_densepose_{}/{}/state",
+            self.builder.discovery_prefix,
+            entity.component().as_str(),
+            self.builder.node_id,
+            entity.topic_slug(),
+        );
+        Some(StateMessage::new(topic, payload, DiscoveryComponent::Sensor, false))
+    }
 }
 
 fn iso_ts(ms: i64) -> String {
@@ -348,6 +379,33 @@ mod tests {
             rssi_dbm: Some(-52.0),
             vital_confidence: 0.87,
         }
+    }
+
+    // ─── Scalar encoder (semantic fall_risk score) ──────────────────
+
+    #[test]
+    fn scalar_encodes_fall_risk_score_on_sensor_topic() {
+        let b = builder();
+        let enc = StateEncoder { builder: &b };
+        let m = enc
+            .scalar(EntityKind::FallRiskElevated, 73.0, 1779_512_400_000)
+            .expect("fall_risk is a Sensor entity");
+        assert!(m.topic.ends_with("/fall_risk_elevated/state"));
+        assert!(m.topic.contains("/sensor/"));
+        let v: Value = serde_json::from_str(&m.payload).unwrap();
+        assert_eq!(v["score"], 73.0);
+        assert!(v.get("ts").is_some());
+        // Sensor state: QoS 0, not retained (per §3.5).
+        assert_eq!(m.qos, 0);
+        assert!(!m.retain);
+    }
+
+    #[test]
+    fn scalar_rejects_non_sensor_entities() {
+        let b = builder();
+        let enc = StateEncoder { builder: &b };
+        // A binary_sensor semantic primitive must not be encoded as a scalar.
+        assert!(enc.scalar(EntityKind::NoMovement, 1.0, 0).is_none());
     }
 
     // ─── Rate limiter ────────────────────────────────────────────────

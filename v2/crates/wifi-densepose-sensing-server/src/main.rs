@@ -5838,7 +5838,11 @@ fn semantic_event_to_json(ev: &SemanticEvent) -> serde_json::Value {
 /// WS clients consume), so this is purely additive — no new routes, no change
 /// to the existing `sensing_update` payload. Event delivery to first-class
 /// MQTT/Matter entities is the tracked follow-up.
-async fn semantic_tick_task(state: SharedState, tick_ms: u64) {
+async fn semantic_tick_task(
+    state: SharedState,
+    tick_ms: u64,
+    semantic_tx: broadcast::Sender<SemanticEvent>,
+) {
     use chrono::Timelike;
 
     let mut bus = SemanticBus::new(PrimitiveConfig::default());
@@ -5889,6 +5893,9 @@ async fn semantic_tick_task(state: SharedState, tick_ms: u64) {
             if let Ok(json) = serde_json::to_string(&semantic_event_to_json(ev)) {
                 let _ = s.tx.send(json);
             }
+            // Also hand the typed event to the MQTT publisher (no-op when there
+            // are no subscribers, e.g. `--mqtt` off or built without the feature).
+            let _ = semantic_tx.send(ev.clone());
         }
     }
 }
@@ -6895,6 +6902,13 @@ async fn main() {
     // clients drop oldest, identical backpressure shape.
     let (intro_tx, _) = broadcast::channel::<String>(256);
 
+    // ADR-115 §3.12 — typed channel carrying `SemanticEvent`s from the bus to
+    // the MQTT publisher (the WS stream gets them as JSON separately). Kept
+    // alive by `semantic_tick_task`'s sender clone; the publisher subscribes
+    // below when `--features mqtt` + `--mqtt` are active. Drop the initial
+    // receiver — subscribers are created on demand.
+    let (semantic_tx, _) = broadcast::channel::<SemanticEvent>(64);
+
     // #872: actually start the MQTT publisher when `--mqtt` is set. The publisher
     // (mqtt::) consumes a typed VitalsSnapshot stream; we bridge the existing JSON
     // sensing broadcast into it with a defensive serde_json::Value mapping (absent
@@ -6919,7 +6933,8 @@ async fn main() {
                     };
                     let (vtx, vrx) = broadcast::channel::<mqtt::state::VitalsSnapshot>(64);
                     let (host, port) = (mcfg.host.clone(), mcfg.port);
-                    mqtt::publisher::spawn(mcfg, builder, vrx);
+                    // ADR-115 §3.12: route the semantic bus to HA entities too.
+                    mqtt::publisher::spawn(mcfg, builder, vrx, semantic_tx.subscribe());
                     let mut jrx = tx.subscribe();
                     tokio::spawn(async move {
                         while let Ok(json) = jrx.recv().await {
@@ -7061,7 +7076,11 @@ async fn main() {
     // broadcast and emitted on the WS stream as `semantic_event` messages.
     if args.semantic {
         info!("Semantic inference bus enabled (ADR-115 §3.12) — emitting semantic_event on /ws");
-        tokio::spawn(semantic_tick_task(state.clone(), args.tick_ms));
+        tokio::spawn(semantic_tick_task(
+            state.clone(),
+            args.tick_ms,
+            semantic_tx.clone(),
+        ));
     }
 
     // ADR-050: Parse bind address once, use for all listeners

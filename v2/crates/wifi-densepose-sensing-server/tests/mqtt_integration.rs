@@ -45,6 +45,7 @@ use wifi_densepose_sensing_server::mqtt::{
     publisher::{spawn, OwnedDiscoveryBuilder},
     state::VitalsSnapshot,
 };
+use wifi_densepose_sensing_server::semantic::SemanticEvent;
 
 fn should_run() -> Option<u16> {
     if std::env::var("RUVIEW_RUN_INTEGRATION").is_err() {
@@ -172,7 +173,10 @@ async fn discovery_topics_appear_on_broker() {
     let cfg = make_cfg(port, false, "discovery");
     let builder = make_builder("inttest1");
     let (tx, rx) = broadcast::channel::<VitalsSnapshot>(32);
-    let _handle = spawn(cfg, builder, rx);
+    // Semantic events aren't exercised by this vitals test; pass an idle
+    // receiver (the publisher tolerates a quiet/closed semantic channel).
+    let (_sem_tx, sem_rx) = broadcast::channel::<SemanticEvent>(8);
+    let _handle = spawn(cfg, builder, rx, sem_rx);
 
     // #898: discovery is now published per-node the first time a snapshot for
     // that node_id arrives (not eagerly at startup). Drive snapshots for
@@ -238,7 +242,10 @@ async fn privacy_mode_suppresses_biometric_discovery() {
     let cfg = make_cfg(port, /* privacy_mode = */ true, "privacy");
     let builder = make_builder("inttest2");
     let (tx, rx) = broadcast::channel::<VitalsSnapshot>(32);
-    let _handle = spawn(cfg, builder, rx);
+    // Semantic events aren't exercised by this vitals test; pass an idle
+    // receiver (the publisher tolerates a quiet/closed semantic channel).
+    let (_sem_tx, sem_rx) = broadcast::channel::<SemanticEvent>(8);
+    let _handle = spawn(cfg, builder, rx, sem_rx);
 
     // #898: per-node discovery is triggered by a snapshot for that node_id.
     let tx_bg = tx.clone();
@@ -301,7 +308,10 @@ async fn state_messages_published_on_snapshot_broadcast() {
     let cfg = make_cfg(port, false, "state");
     let builder = make_builder("inttest3");
     let (tx, rx) = broadcast::channel::<VitalsSnapshot>(32);
-    let _handle = spawn(cfg, builder, rx);
+    // Semantic events aren't exercised by this vitals test; pass an idle
+    // receiver (the publisher tolerates a quiet/closed semantic channel).
+    let (_sem_tx, sem_rx) = broadcast::channel::<SemanticEvent>(8);
+    let _handle = spawn(cfg, builder, rx, sem_rx);
 
     // Iter 46 — instead of front-loading 6 snapshots and hoping the
     // publisher's startup beats them, drive snapshots in a background

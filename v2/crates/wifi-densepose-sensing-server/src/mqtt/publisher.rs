@@ -38,6 +38,7 @@ use tracing::{error, info, warn};
 use super::config::{MqttConfig, TlsConfig};
 use super::discovery::{DiscoveryBuilder, EntityKind};
 use super::state::{RateLimiter, StateEncoder, StateMessage, VitalsSnapshot};
+use crate::semantic::{PrimitiveState, SemanticEvent, SemanticKind};
 
 /// Heartbeat cadence for availability re-publication (per §3.6).
 const AVAILABILITY_HEARTBEAT: Duration = Duration::from_secs(30);
@@ -87,10 +88,51 @@ pub fn spawn(
     cfg: Arc<MqttConfig>,
     builder_owned: OwnedDiscoveryBuilder,
     state_rx: broadcast::Receiver<VitalsSnapshot>,
+    semantic_rx: broadcast::Receiver<SemanticEvent>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        run(cfg, builder_owned, state_rx).await;
+        run(cfg, builder_owned, state_rx, semantic_rx).await;
     })
+}
+
+/// Map a bus [`SemanticKind`] onto the publisher's [`EntityKind`]. 1:1 with
+/// the ADR-115 §3.12 entity catalog.
+fn semantic_kind_to_entity(kind: SemanticKind) -> EntityKind {
+    match kind {
+        SemanticKind::SomeoneSleeping => EntityKind::SomeoneSleeping,
+        SemanticKind::PossibleDistress => EntityKind::PossibleDistress,
+        SemanticKind::RoomActive => EntityKind::RoomActive,
+        SemanticKind::ElderlyAnomaly => EntityKind::ElderlyInactivityAnomaly,
+        SemanticKind::Meeting => EntityKind::MeetingInProgress,
+        SemanticKind::BathroomOccupied => EntityKind::BathroomOccupied,
+        SemanticKind::FallRisk => EntityKind::FallRiskElevated,
+        SemanticKind::BedExit => EntityKind::BedExit,
+        SemanticKind::NoMovement => EntityKind::NoMovement,
+        SemanticKind::MultiRoom => EntityKind::MultiRoomTransition,
+    }
+}
+
+/// Lazily publish a node's discovery + availability the first time we see it,
+/// then remember it for heartbeats and offline LWT. Shared by the vitals and
+/// semantic paths so both surface under proper HA devices.
+async fn ensure_node_registered(
+    client: &AsyncClient,
+    nodes: &mut std::collections::HashMap<String, (OwnedDiscoveryBuilder, NodeAvailability)>,
+    nb: OwnedDiscoveryBuilder,
+    entities: &[EntityKind],
+) {
+    if nodes.contains_key(&nb.node_id) {
+        return;
+    }
+    let borrowed = nb.as_borrowed();
+    if let Err(e) = publish_all_discovery(client, &borrowed, entities).await {
+        warn!("[mqtt] node {} discovery failed: {e}", nb.node_id);
+    }
+    let na = NodeAvailability::for_builder(&borrowed, entities);
+    if let Err(e) = publish_availability(client, &na, "online").await {
+        warn!("[mqtt] node {} availability failed: {e}", nb.node_id);
+    }
+    nodes.insert(nb.node_id.clone(), (nb, na));
 }
 
 /// Owned twin of [`DiscoveryBuilder`] so the publisher task doesn't need
@@ -142,6 +184,7 @@ async fn run(
     cfg: Arc<MqttConfig>,
     builder_owned: OwnedDiscoveryBuilder,
     mut state_rx: broadcast::Receiver<VitalsSnapshot>,
+    mut semantic_rx: broadcast::Receiver<SemanticEvent>,
 ) {
     let opts = build_mqtt_options(&cfg);
     let (client, mut eventloop): (AsyncClient, EventLoop) = AsyncClient::new(opts, 256);
@@ -252,6 +295,48 @@ async fn run(
                         return;
                     }
 
+                }
+            }
+
+            // Inbound semantic primitive from the ADR-115 §3.12 bus. Room-level
+            // inferred states publish under the base device. The bus already
+            // debounces (hysteresis + refractory + Idle filtering), so we
+            // publish each emitted event directly; HA dedups equal retained
+            // binary states harmlessly.
+            recv_sem = semantic_rx.recv() => {
+                match recv_sem {
+                    Ok(ev) => {
+                        let entity = semantic_kind_to_entity(ev.kind);
+                        ensure_node_registered(
+                            &client, &mut nodes, builder_owned.clone(), &entities,
+                        ).await;
+                        let borrowed = nodes[&builder_owned.node_id].0.as_borrowed();
+                        let encoder = StateEncoder { builder: &borrowed };
+                        let msg = match &ev.state {
+                            PrimitiveState::Boolean { active, .. } => {
+                                encoder.boolean(entity, *active)
+                            }
+                            PrimitiveState::Scalar { value, .. } => {
+                                encoder.scalar(entity, *value, ev.timestamp_ms)
+                            }
+                            PrimitiveState::Event { event_type, .. } => {
+                                encoder.event(entity, *event_type, ev.timestamp_ms, None)
+                            }
+                            PrimitiveState::Idle => None,
+                        };
+                        if let Some(m) = msg {
+                            let _ = publish_state(&client, &m).await;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("[mqtt] semantic stream lagged by {n} — dropped");
+                    }
+                    // The bus sender lives for the process lifetime, so Closed
+                    // shouldn't happen; sleep briefly to avoid a busy-loop if it
+                    // ever does (the vitals channel drives shutdown).
+                    Err(broadcast::error::RecvError::Closed) => {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
                 }
             }
         }
