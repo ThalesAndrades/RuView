@@ -109,15 +109,63 @@ impl SemanticBus {
             })
             .collect()
     }
+
+    /// Capture the learned, long-lived baselines for cross-restart persistence
+    /// (see [`super::persistence`]). Session-relative FSM timers are not
+    /// captured — they correctly reset on restart.
+    pub fn snapshot(&self) -> super::persistence::SemanticSnapshot {
+        super::persistence::SemanticSnapshot {
+            elderly_longest_idle_secs: self.elderly_anomaly.baseline().as_secs_f64(),
+            distress_hr_baseline: self.distress.hr_baseline(),
+        }
+    }
+
+    /// Restore learned baselines from a persisted snapshot into a fresh bus.
+    /// Each primitive floors/validates the incoming value, so a stale or
+    /// corrupt file can never make a safety gate fire too eagerly.
+    pub fn restore(&mut self, snap: &super::persistence::SemanticSnapshot) {
+        if snap.elderly_longest_idle_secs.is_finite() && snap.elderly_longest_idle_secs > 0.0 {
+            self.elderly_anomaly
+                .set_baseline(std::time::Duration::from_secs_f64(snap.elderly_longest_idle_secs));
+        }
+        if let Some(hr) = snap.distress_hr_baseline {
+            self.distress.set_hr_baseline(hr);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::persistence::SemanticSnapshot;
     use std::time::Duration;
 
     fn cfg() -> PrimitiveConfig {
         PrimitiveConfig::default()
+    }
+
+    #[test]
+    fn snapshot_restore_round_trips_learned_baselines() {
+        let mut bus = SemanticBus::new(cfg());
+        bus.restore(&SemanticSnapshot {
+            elderly_longest_idle_secs: 7200.0, // 2 h learned baseline
+            distress_hr_baseline: Some(70.0),
+        });
+        let s = bus.snapshot();
+        assert!((s.elderly_longest_idle_secs - 7200.0).abs() < 1e-6);
+        assert_eq!(s.distress_hr_baseline, Some(70.0));
+    }
+
+    #[test]
+    fn restore_floors_a_too_small_inactivity_baseline() {
+        // A stale/corrupt tiny value must not drop below the 30-min safety
+        // floor (else the anomaly would fire far too eagerly after a reboot).
+        let mut bus = SemanticBus::new(cfg());
+        bus.restore(&SemanticSnapshot {
+            elderly_longest_idle_secs: 60.0, // 1 min — below the floor
+            distress_hr_baseline: None,
+        });
+        assert!(bus.snapshot().elderly_longest_idle_secs >= 1800.0);
     }
 
     #[test]

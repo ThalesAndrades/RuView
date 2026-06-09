@@ -28,6 +28,7 @@ use wifi_densepose_sensing_server::{dataset, embedding, graph_transformer, train
 use wifi_densepose_sensing_server::semantic::{
     PrimitiveConfig, PrimitiveState, RawSnapshot, SemanticBus, SemanticEvent, SemanticKind,
 };
+use wifi_densepose_sensing_server::semantic::persistence as semantic_persistence;
 
 use ruvector_mincut::{DynamicMinCut, MinCutBuilder};
 use std::collections::{HashMap, VecDeque};
@@ -5845,7 +5846,42 @@ async fn semantic_tick_task(
 ) {
     use chrono::Timelike;
 
+    /// How often the learned semantic baselines are flushed to disk.
+    const SEMANTIC_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(300);
+
     let mut bus = SemanticBus::new(PrimitiveConfig::default());
+
+    // Restore learned baselines (inactivity, distress HR) so a restart doesn't
+    // relearn from a cold floor — otherwise the inactivity gate mis-fires for
+    // hours after every reboot. First run (no file) starts cold.
+    let data_dir = state.read().await.data_dir.clone();
+    match semantic_persistence::load(&data_dir) {
+        Ok(snap) => {
+            bus.restore(&snap);
+            info!(
+                "Restored semantic baselines: inactivity={:.0}s, distress_hr_baseline={:?}",
+                snap.elderly_longest_idle_secs, snap.distress_hr_baseline
+            );
+        }
+        Err(err) => {
+            // Only a missing file is a genuine cold start. A corrupt JSON or a
+            // permission/I/O error must NOT silently disable persistence (which
+            // would relearn from scratch every restart) — surface it.
+            if err
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+            {
+                info!("No persisted semantic baselines yet (cold start)");
+            } else {
+                warn!(
+                    "Failed to restore semantic baselines from {}: {err}; starting cold",
+                    data_dir.display()
+                );
+            }
+        }
+    }
+    let mut last_save = std::time::Instant::now();
+
     let started = std::time::Instant::now();
     // The primitives debounce on `since_start`; a ~1 Hz cadence is plenty and
     // keeps the bus cheap regardless of the (faster) sensing tick. Floor at
@@ -5856,6 +5892,15 @@ async fn semantic_tick_task(
     loop {
         interval.tick().await;
         let tod = chrono::Local::now().num_seconds_from_midnight();
+
+        // Flush learned baselines periodically (runs regardless of the skips
+        // below, so an idle/offline room still persists what it has learned).
+        if last_save.elapsed() >= SEMANTIC_SNAPSHOT_INTERVAL {
+            if let Err(e) = semantic_persistence::save(&data_dir, &bus.snapshot()) {
+                warn!("Failed to persist semantic baselines: {e}");
+            }
+            last_save = std::time::Instant::now();
+        }
 
         let snap = {
             let s = state.read().await;

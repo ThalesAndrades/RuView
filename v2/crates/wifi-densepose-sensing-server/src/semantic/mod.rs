@@ -62,7 +62,11 @@ mod sleeping;
 // ADR-140: auditable semantic-state record + Ruflo multi-signal agent bridge.
 pub mod record;
 
+// Cross-restart persistence for learned baselines (inactivity, distress HR).
+pub mod persistence;
+
 pub use bus::{SemanticBus, SemanticEvent, SemanticKind};
+pub use persistence::SemanticSnapshot;
 pub use common::{PrimitiveConfig, PrimitiveState, RawSnapshot, Reason};
 pub use record::{
     AgentRoute, MultiSignalRule, PrivacyAction, RecordContext, SemanticStateRecord, route_all,
