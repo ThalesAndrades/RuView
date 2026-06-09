@@ -26,7 +26,7 @@ use wifi_densepose_sensing_server::{dataset, embedding, graph_transformer, train
 // ADR-115 §3.12 — semantic inference bus (HA-MIND). Drives the 10 primitive
 // FSMs from the live sensing broadcast. See `semantic_tick_task`.
 use wifi_densepose_sensing_server::semantic::{
-    PrimitiveConfig, PrimitiveState, RawSnapshot, SemanticBus, SemanticEvent, SemanticKind,
+    PrimitiveConfig, PrimitiveState, RawSnapshot, SemanticBus, SemanticEvent, SemanticKind, ZoneMap,
 };
 use wifi_densepose_sensing_server::semantic::persistence as semantic_persistence;
 
@@ -100,6 +100,12 @@ struct Args {
     /// `--semantic false` to disable (e.g. raw-signal-only deployments).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     semantic: bool,
+
+    /// Node→zone map (JSON, ADR-115 §3.12 zone-centric schema) that unlocks the
+    /// zone-gated primitives (`bed_exit`, `bathroom_occupied`,
+    /// `multi_room_transition`). Without it those three stay dormant.
+    #[arg(long, value_name = "PATH")]
+    semantic_zones_file: Option<std::path::PathBuf>,
 
     /// Bind address (default 127.0.0.1; set to 0.0.0.0 for network access)
     #[arg(long, default_value = "127.0.0.1", env = "SENSING_BIND_ADDR")]
@@ -4945,6 +4951,21 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         0
                     };
                     ns.prev_person_count = node_est;
+                    // Edge-vitals-only nodes (e.g. C6 + mmWave) never run the
+                    // CSI debounce, so without this their `current_motion_level`
+                    // stays "absent" and `build_node_features` reports them as
+                    // not present — leaving every zone they cover inactive
+                    // (bathroom_occupied / bed_exit by mmWave would never fire).
+                    // Drive presence straight from the (firmware-debounced)
+                    // vitals flags.
+                    ns.current_motion_level = if vitals.motion {
+                        "present_moving"
+                    } else if vitals.presence {
+                        "present_still"
+                    } else {
+                        "absent"
+                    }
+                    .to_string();
 
                     s.tick += 1;
                     let tick = s.tick;
@@ -5749,19 +5770,41 @@ fn motion_level_to_scalar(level: &str) -> f64 {
 /// Project the live `SensingUpdate` broadcast onto a `RawSnapshot` for the
 /// semantic bus.
 ///
-/// Zones are intentionally empty: the node→zone model (ADR-115 §3.12,
-/// `--semantic-zones-file`) is unresolved, so the three zone-gated primitives
-/// (bed_exit, bathroom, multi_room) stay dormant — their documented, tested
-/// behavior when zones are unconfigured. The seven zone-free primitives run
-/// fully. Routing events to MQTT/Matter entities + the zone model are the
-/// tracked follow-up.
+/// When a `ZoneMap` is supplied (ADR-115 §3.12, `--semantic-zones-file`), the
+/// zone-gated primitives (`bed_exit`, `bathroom`, `multi_room`) are fed:
+/// `active_zones` is resolved from which nodes currently report presence (the
+/// per-node `node_features` breakdown, excluding stale nodes), and `bed_zones`
+/// is the static bed-tagged set. With no map (or a source that lacks per-node
+/// features) zones stay empty and those three primitives remain dormant — their
+/// documented, tested behavior. The seven zone-free primitives always run.
 fn build_semantic_snapshot(
     update: &SensingUpdate,
     since_start: Duration,
     local_seconds_since_midnight: u32,
+    zones: Option<&ZoneMap>,
 ) -> RawSnapshot {
     let vitals = update.vital_signs.as_ref();
     let presence = update.classification.presence;
+
+    // Per-node presence drives zone activation. A stale node's classification
+    // is frozen (no fresh frames), so it must not keep a zone "occupied".
+    let (active_zones, bed_zones) = match zones {
+        Some(zm) => {
+            let present_nodes: Vec<String> = update
+                .node_features
+                .as_ref()
+                .map(|nfs| {
+                    nfs.iter()
+                        .filter(|nf| nf.classification.presence && !nf.stale)
+                        .map(|nf| nf.node_id.to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            (zm.active_zones(&present_nodes), zm.bed_zones())
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+
     RawSnapshot {
         node_id: "aggregate".to_string(),
         since_start,
@@ -5779,8 +5822,8 @@ fn build_semantic_snapshot(
         vital_confidence: vitals
             .map(|v| v.signal_quality)
             .unwrap_or(update.classification.confidence),
-        active_zones: Vec::new(),
-        bed_zones: Vec::new(),
+        active_zones,
+        bed_zones,
         local_seconds_since_midnight,
     }
 }
@@ -5843,6 +5886,7 @@ async fn semantic_tick_task(
     state: SharedState,
     tick_ms: u64,
     semantic_tx: broadcast::Sender<SemanticEvent>,
+    zones: Option<std::sync::Arc<ZoneMap>>,
 ) {
     use chrono::Timelike;
 
@@ -5888,6 +5932,9 @@ async fn semantic_tick_task(
     // 1000 ms so the default `--tick-ms=100` doesn't push the semantic stream
     // to 10× the documented rate (a higher `--tick-ms` can still slow it).
     let mut interval = tokio::time::interval(Duration::from_millis(tick_ms.max(1000)));
+    // Identity of the last `latest_update` we ticked the bus on; lets us skip
+    // re-processing a frozen frame even when the source string doesn't flip.
+    let mut last_seen_update_tick: Option<u64> = None;
 
     loop {
         interval.tick().await;
@@ -5904,18 +5951,24 @@ async fn semantic_tick_task(
 
         let snap = {
             let s = state.read().await;
-            // Don't tick the bus from a frozen `latest_update`: when the ESP32
-            // source goes stale `effective_source()` returns `…:offline` (set
-            // by `broadcast_tick_task`), and re-running the primitives on the
-            // last-seen frame would manufacture false someone_sleeping /
-            // no_movement / inactivity events from data that stopped arriving.
-            // Skip until fresh data resumes.
+            // Don't tick the bus from a frozen `latest_update`. Two guards:
+            //  1. The ESP32 source explicitly flips to `…:offline` (set by
+            //     `broadcast_tick_task`) after a staleness timeout.
+            //  2. Any source (wifi/simulate too) can stall *without* changing
+            //     `effective_source`; re-ticking the same frame would let the
+            //     duration-based primitives (no_movement / inactivity / sleeping)
+            //     falsely accumulate from data that stopped arriving. So skip
+            //     any update whose `tick` we've already processed.
             if s.effective_source().ends_with(":offline") {
                 None
             } else {
-                s.latest_update
-                    .as_ref()
-                    .map(|u| build_semantic_snapshot(u, started.elapsed(), tod))
+                s.latest_update.as_ref().and_then(|u| {
+                    if last_seen_update_tick == Some(u.tick) {
+                        return None; // unchanged since last tick — don't re-accumulate
+                    }
+                    last_seen_update_tick = Some(u.tick);
+                    Some(build_semantic_snapshot(u, started.elapsed(), tod, zones.as_deref()))
+                })
             }
         };
         let Some(snap) = snap else { continue };
@@ -6027,7 +6080,7 @@ mod semantic_wiring_tests {
             signal_quality: 0.7,
         });
 
-        let snap = build_semantic_snapshot(&u, Duration::from_secs(120), 2 * 3600);
+        let snap = build_semantic_snapshot(&u, Duration::from_secs(120), 2 * 3600, None);
         assert!(snap.presence);
         assert!(snap.motion < 0.02);
         assert_eq!(snap.n_persons, 2);
@@ -6042,12 +6095,66 @@ mod semantic_wiring_tests {
     fn snapshot_defaults_count_from_presence_when_unspecified() {
         let mut u = base_update();
         u.classification.presence = true; // no estimated_persons
-        let snap = build_semantic_snapshot(&u, Duration::from_secs(1), 0);
+        let snap = build_semantic_snapshot(&u, Duration::from_secs(1), 0, None);
         assert_eq!(snap.n_persons, 1);
 
         u.classification.presence = false;
-        let snap = build_semantic_snapshot(&u, Duration::from_secs(1), 0);
+        let snap = build_semantic_snapshot(&u, Duration::from_secs(1), 0, None);
         assert_eq!(snap.n_persons, 0);
+    }
+
+    fn node_feature(node_id: u8, present: bool, stale: bool) -> PerNodeFeatureInfo {
+        PerNodeFeatureInfo {
+            node_id,
+            features: FeatureInfo {
+                mean_rssi: -55.0,
+                variance: 0.0,
+                motion_band_power: 0.0,
+                breathing_band_power: 0.0,
+                dominant_freq_hz: 0.0,
+                change_points: 0,
+                spectral_power: 0.0,
+            },
+            classification: ClassificationInfo {
+                motion_level: if present { "present_still".into() } else { "absent".into() },
+                presence: present,
+                confidence: 0.5,
+            },
+            rssi_dbm: -55.0,
+            last_seen_ms: 100,
+            frame_rate_hz: 20.0,
+            stale,
+            novelty_score: None,
+        }
+    }
+
+    #[test]
+    fn zones_resolve_from_per_node_presence() {
+        let zm = ZoneMap::from_json_str(
+            r#"{ "zones": [
+                { "name": "bedroom",  "nodes": ["1"], "tags": ["bed"] },
+                { "name": "bathroom", "nodes": ["2"], "tags": ["bathroom"] }
+            ] }"#,
+        )
+        .unwrap();
+
+        // Node 1 present (bedroom), node 2 absent (bathroom empty).
+        let mut u = base_update();
+        u.node_features = Some(vec![node_feature(1, true, false), node_feature(2, false, false)]);
+        let snap = build_semantic_snapshot(&u, Duration::from_secs(120), 0, Some(&zm));
+        assert_eq!(snap.active_zones, vec!["bedroom"]);
+        // bed_zones is the static bed-tagged set regardless of presence.
+        assert_eq!(snap.bed_zones, vec!["bedroom"]);
+
+        // A *stale* present node must not keep its zone active.
+        let mut u2 = base_update();
+        u2.node_features = Some(vec![node_feature(1, true, /* stale */ true)]);
+        let snap2 = build_semantic_snapshot(&u2, Duration::from_secs(120), 0, Some(&zm));
+        assert!(snap2.active_zones.is_empty(), "stale node must not activate a zone");
+
+        // Without a zone map the zone-gated primitives stay dormant.
+        let snap3 = build_semantic_snapshot(&u, Duration::from_secs(120), 0, None);
+        assert!(snap3.active_zones.is_empty() && snap3.bed_zones.is_empty());
     }
 
     #[test]
@@ -7124,11 +7231,55 @@ async fn main() {
     // alongside every source so the 10 primitives are driven from the live
     // broadcast and emitted on the WS stream as `semantic_event` messages.
     if args.semantic {
+        // Optional node→zone map: unlocks bed_exit / bathroom / multi_room.
+        // A bad file is logged and ignored (the 7 zone-free primitives still
+        // run) rather than failing startup.
+        let zones = args.semantic_zones_file.as_ref().and_then(|p| {
+            // Defensive path hygiene at the CLI trust boundary (repo guideline
+            // "sanitize file paths"). The operator already has process
+            // privileges, so this isn't a privilege boundary — but rejecting
+            // `..` traversal and non-files keeps the input well-formed and the
+            // failure mode explicit. No allowlist base: an operator may
+            // legitimately point at an absolute config path (e.g.
+            // /etc/ruview/zones.json), so `ZoneMap::from_file` stays general.
+            if p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                warn!(
+                    "Rejected --semantic-zones-file {}: parent-directory ('..') traversal is not allowed",
+                    p.display()
+                );
+                return None;
+            }
+            if !p.is_file() {
+                warn!(
+                    "--semantic-zones-file {} is not a readable file; zone-gated primitives stay dormant",
+                    p.display()
+                );
+                return None;
+            }
+            match ZoneMap::from_file(p) {
+                Ok(zm) => {
+                    info!(
+                        "Semantic zones loaded from {} — {} zone(s); zone-gated primitives active",
+                        p.display(),
+                        zm.len()
+                    );
+                    Some(std::sync::Arc::new(zm))
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to load --semantic-zones-file {}: {e}; zone-gated primitives stay dormant",
+                        p.display()
+                    );
+                    None
+                }
+            }
+        });
         info!("Semantic inference bus enabled (ADR-115 §3.12) — emitting semantic_event on /ws");
         tokio::spawn(semantic_tick_task(
             state.clone(),
             args.tick_ms,
             semantic_tx.clone(),
+            zones,
         ));
     }
 

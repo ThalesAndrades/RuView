@@ -65,9 +65,13 @@ pub mod record;
 // Cross-restart persistence for learned baselines (inactivity, distress HR).
 pub mod persistence;
 
+// ADR-115 §3.12: node→zone model for the zone-gated primitives.
+pub mod zones;
+
 pub use bus::{SemanticBus, SemanticEvent, SemanticKind};
 pub use persistence::SemanticSnapshot;
 pub use common::{PrimitiveConfig, PrimitiveState, RawSnapshot, Reason};
 pub use record::{
     AgentRoute, MultiSignalRule, PrivacyAction, RecordContext, SemanticStateRecord, route_all,
 };
+pub use zones::{ZoneMap, ZoneSpec};
