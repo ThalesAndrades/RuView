@@ -1,0 +1,60 @@
+# RuView pilot stack — MQTT broker + sensing-server, wired for Home Assistant.
+#
+# This is the turnkey single-room / small-deployment kit referenced by
+# deploy/pilot/README.md. It brings up:
+#   - mosquitto     : the MQTT broker Home Assistant auto-discovers RuView through
+#   - sensing-server: the RuView Rust server (built --features mqtt) publishing
+#                     the ADR-115 §3.12 semantic primitives as HA entities
+#
+# Home Assistant itself is NOT included — point your existing HA's MQTT
+# integration at this broker (host = the machine running this compose, :1883).
+#
+# Quick start:
+#   cp .env.example .env            # then edit MQTT creds
+#   cp zones.example.json zones.json
+#   docker compose up -d
+# See README.md for the full runbook.
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    ports:
+      - "1883:1883"            # MQTT — Home Assistant connects here
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-log:/mosquitto/log
+      # For password auth (recommended — see mosquitto.conf), also mount:
+      # - ./passwd:/mosquitto/config/passwd:ro
+
+  sensing-server:
+    # Pull the published multi-arch image (amd64 + arm64, e.g. Raspberry Pi).
+    image: ruvnet/wifi-densepose:latest
+    # To build locally instead of pulling, comment `image:` above and uncomment:
+    # build:
+    #   context: ../..
+    #   dockerfile: docker/Dockerfile.rust
+    restart: unless-stopped
+    depends_on:
+      - mosquitto
+    env_file:
+      - .env
+    ports:
+      - "3000:3000"            # REST API + UI
+      - "3001:3001"            # WebSocket sensing stream
+      - "5005:5005/udp"        # ESP32 CSI frames (see Windows note in README)
+    volumes:
+      - ./zones.json:/config/zones.json:ro   # node→zone map (ADR-115 §3.12)
+      # Mount a directory of .rvf model files and set MODELS_DIR in .env to use them:
+      # - ./models:/app/models:ro
+    # The entrypoint prepends the binary + base flags (--source/--http-port/…)
+    # and forwards these. MQTT is enabled via RUVIEW_MQTT in .env; the zones
+    # file unlocks bed_exit / bathroom_occupied / multi_room_transition.
+    command:
+      - "--semantic-zones-file"
+      - "/config/zones.json"
+
+volumes:
+  mosquitto-data:
+  mosquitto-log:

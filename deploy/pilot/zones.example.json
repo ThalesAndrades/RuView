@@ -1,0 +1,7 @@
+{
+  "_comment": "RuView node->zone map (ADR-115 §3.12). Copy to zones.json and edit. 'nodes' are the ESP32 node ids you set with provision.py --node-id (stringified). A zone needs its own node to be distinguishable: bed_exit needs a node by the bed; bathroom_occupied needs a node in the bathroom. The bathroom primitive matches a zone NAMED 'bathroom'. Tag 'bed' marks the bed zone for bed_exit.",
+  "zones": [
+    { "name": "bedroom",  "nodes": ["1"], "tags": ["bed"] },
+    { "name": "bathroom", "nodes": ["2"], "tags": ["bathroom"] }
+  ]
+}
