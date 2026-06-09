@@ -1,0 +1,4 @@
+.agentdb/
+*.db
+*.db-shm
+*.db-wal
