@@ -4951,6 +4951,21 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         0
                     };
                     ns.prev_person_count = node_est;
+                    // Edge-vitals-only nodes (e.g. C6 + mmWave) never run the
+                    // CSI debounce, so without this their `current_motion_level`
+                    // stays "absent" and `build_node_features` reports them as
+                    // not present — leaving every zone they cover inactive
+                    // (bathroom_occupied / bed_exit by mmWave would never fire).
+                    // Drive presence straight from the (firmware-debounced)
+                    // vitals flags.
+                    ns.current_motion_level = if vitals.motion {
+                        "present_moving"
+                    } else if vitals.presence {
+                        "present_still"
+                    } else {
+                        "absent"
+                    }
+                    .to_string();
 
                     s.tick += 1;
                     let tick = s.tick;
@@ -5917,6 +5932,9 @@ async fn semantic_tick_task(
     // 1000 ms so the default `--tick-ms=100` doesn't push the semantic stream
     // to 10× the documented rate (a higher `--tick-ms` can still slow it).
     let mut interval = tokio::time::interval(Duration::from_millis(tick_ms.max(1000)));
+    // Identity of the last `latest_update` we ticked the bus on; lets us skip
+    // re-processing a frozen frame even when the source string doesn't flip.
+    let mut last_seen_update_tick: Option<u64> = None;
 
     loop {
         interval.tick().await;
@@ -5933,18 +5951,24 @@ async fn semantic_tick_task(
 
         let snap = {
             let s = state.read().await;
-            // Don't tick the bus from a frozen `latest_update`: when the ESP32
-            // source goes stale `effective_source()` returns `…:offline` (set
-            // by `broadcast_tick_task`), and re-running the primitives on the
-            // last-seen frame would manufacture false someone_sleeping /
-            // no_movement / inactivity events from data that stopped arriving.
-            // Skip until fresh data resumes.
+            // Don't tick the bus from a frozen `latest_update`. Two guards:
+            //  1. The ESP32 source explicitly flips to `…:offline` (set by
+            //     `broadcast_tick_task`) after a staleness timeout.
+            //  2. Any source (wifi/simulate too) can stall *without* changing
+            //     `effective_source`; re-ticking the same frame would let the
+            //     duration-based primitives (no_movement / inactivity / sleeping)
+            //     falsely accumulate from data that stopped arriving. So skip
+            //     any update whose `tick` we've already processed.
             if s.effective_source().ends_with(":offline") {
                 None
             } else {
-                s.latest_update
-                    .as_ref()
-                    .map(|u| build_semantic_snapshot(u, started.elapsed(), tod, zones.as_deref()))
+                s.latest_update.as_ref().and_then(|u| {
+                    if last_seen_update_tick == Some(u.tick) {
+                        return None; // unchanged since last tick — don't re-accumulate
+                    }
+                    last_seen_update_tick = Some(u.tick);
+                    Some(build_semantic_snapshot(u, started.elapsed(), tod, zones.as_deref()))
+                })
             }
         };
         let Some(snap) = snap else { continue };
