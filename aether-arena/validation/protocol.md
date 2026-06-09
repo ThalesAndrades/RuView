@@ -36,13 +36,22 @@ instant — later pass the residual offset to `score.py --offset <s>`.
    python mark.py            # interactive: p=present a=absent b=bed_exit e/x=bathroom …
    ```
    Tier B (recommended for long runs): replace the human marker with independent
-   reference sensors on **separate** MQTT topics — PIR/contact (presence/zones),
-   a bed load-cell (bed_exit oracle), a Polar H10 (vitals oracle) — and convert
-   their logs to the same `{"t","label"}` JSONL.
-
-4. **Score**:
+   reference sensors — PIR/contact (presence/zones), a bed load-cell (bed_exit
+   oracle), a Polar H10 (vitals oracle). Log each to a CSV and convert them with
+   `reference.py`, which emits the same `groundtruth.jsonl` plus a `vitalsref.jsonl`
+   for vitals:
    ```bash
-   python score.py --session session.jsonl --truth groundtruth.jsonl
+   python reference.py pir          --in pir.csv   --out groundtruth.jsonl
+   python reference.py bed_loadcell --in bed.csv   --out groundtruth.jsonl --threshold 10
+   python reference.py polar_h10    --in polar.csv --out vitalsref.jsonl
+   ```
+   This is what makes the ~50-bed-exit / ~75-presence-sample power targets below
+   feasible — the sensors self-label while you sleep.
+
+4. **Score** (add `--vitals-ref` to get the HR/BR Bland–Altman section):
+   ```bash
+   python score.py --session session.jsonl --truth groundtruth.jsonl \
+       --vitals-ref vitalsref.jsonl --vitals-tolerance 5
    ```
 
 ## A session script (single-occupant room)

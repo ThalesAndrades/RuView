@@ -35,9 +35,14 @@ def wilson(k, n, z=1.96):
     return (p, max(0.0, c - h), min(1.0, c + h))
 
 
+# System vital metric → its field in the sensing_update `vital_signs` object.
+VITALS_FIELD = {"hr": "heart_rate_bpm", "br": "breathing_rate_bpm"}
+
+
 def load_session(path, offset):
     presence = []   # (t, bool)
     events = []     # (t, primitive, on)
+    vitals = []     # (t, metric, value)  -- system-estimated HR/BR
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -54,9 +59,32 @@ def load_session(path, offset):
                 cls = msg.get("classification")
                 if isinstance(cls, dict) and "presence" in cls:
                     presence.append((t, bool(cls["presence"])))
+                vs = msg.get("vital_signs")
+                if isinstance(vs, dict):
+                    for metric, field in VITALS_FIELD.items():
+                        val = vs.get(field)
+                        if isinstance(val, (int, float)) and val > 0:
+                            vitals.append((t, metric, float(val)))
     presence.sort()
     events.sort()
-    return presence, events
+    vitals.sort()
+    return presence, events, vitals
+
+
+def load_vitals_ref(path):
+    """Reference vitals stream from reference.py: {"t","metric","value"} per metric."""
+    ref = {}   # metric -> [(t, value)]
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            m = rec.get("metric", "hr")
+            ref.setdefault(m, []).append((float(rec["t"]), float(rec["value"])))
+    for m in ref:
+        ref[m].sort()
+    return ref
 
 
 def load_truth(path):
@@ -197,10 +225,59 @@ def score_events(sys_events, truth_events, tau):
     return out
 
 
-def render(presence, events, meta):
+def score_vitals(sys_vitals, ref, tol, window):
+    """Bland–Altman agreement of system HR/BR vs an independent reference.
+
+    Pairs each reference sample with the nearest system sample of the same
+    metric within `window` seconds, then reports bias, 95% limits of agreement,
+    MAE, and the within-±`tol`-BPM rate (with a Wilson CI).
+    """
+    sys_by_metric = {}
+    for (t, m, v) in sys_vitals:
+        sys_by_metric.setdefault(m, []).append((t, v))
+    out = {}
+    for metric, ref_series in ref.items():
+        cand = sys_by_metric.get(metric, [])
+        cand_t = [c[0] for c in cand]
+        diffs = []        # sys - ref
+        pairs = 0
+        for (rt, rv) in ref_series:
+            i = bisect.bisect_left(cand_t, rt)
+            best = None
+            for j in (i - 1, i):
+                if 0 <= j < len(cand_t) and abs(cand_t[j] - rt) <= window:
+                    if best is None or abs(cand_t[j] - rt) < abs(cand_t[best] - rt):
+                        best = j
+            if best is not None:
+                diffs.append(cand[best][1] - rv)
+                pairs += 1
+        if pairs == 0:
+            out[metric] = {"pairs": 0}
+            continue
+        bias = sum(diffs) / pairs
+        var = sum((d - bias) ** 2 for d in diffs) / (pairs - 1) if pairs > 1 else 0.0
+        sd = math.sqrt(var)
+        mae = sum(abs(d) for d in diffs) / pairs
+        within = sum(1 for d in diffs if abs(d) <= tol)
+        w_p, w_lo, w_hi = wilson(within, pairs)
+        out[metric] = {
+            "pairs": pairs,
+            "bias_bpm": round(bias, 2),
+            "sd_bpm": round(sd, 2),
+            "loa95_bpm": [round(bias - 1.96 * sd, 2), round(bias + 1.96 * sd, 2)],
+            "mae_bpm": round(mae, 2),
+            "tol_bpm": tol,
+            "within_tol_rate": round(w_p, 4),
+            "within_tol_ci95": [round(w_lo, 4), round(w_hi, 4)],
+        }
+    return out
+
+
+def render(presence, events, vitals, meta):
     L = []
-    L.append("# RuView field-validation report (ADR-151 P1)\n")
-    L.append(f"- session: `{meta['session']}`  ·  ground truth: `{meta['truth']}`")
+    L.append("# RuView field-validation report (ADR-151)\n")
+    L.append(f"- session: `{meta['session']}`  ·  ground truth: `{meta['truth']}`"
+             + (f"  ·  vitals ref: `{meta['vitals_ref']}`" if meta.get("vitals_ref") else ""))
     L.append(f"- generated: {time.strftime('%Y-%m-%d %H:%M:%S')}  ·  clock offset applied: {meta['offset']:+.2f}s\n")
 
     L.append("## Presence (per-second)\n")
@@ -234,6 +311,25 @@ def render(presence, events, meta):
                      f"{e['recall']} | {e['precision']} | {lat['median']}/{lat['max']}s |")
         L.append("")
 
+    L.append("## Vitals (vs reference — Bland–Altman)\n")
+    if not vitals:
+        L.append("_No vitals reference supplied (`--vitals-ref`)._\n")
+    else:
+        L.append("| metric | pairs | bias | 95% LoA | MAE | within ±tol | tol |")
+        L.append("|---|---|---|---|---|---|---|")
+        for m, v in sorted(vitals.items()):
+            if v.get("pairs", 0) == 0:
+                L.append(f"| {m} | 0 | — | — | — | — | — |")
+                continue
+            loa = v["loa95_bpm"]
+            wci = v["within_tol_ci95"]
+            L.append(f"| {m} | {v['pairs']} | {v['bias_bpm']} | "
+                     f"[{loa[0]}, {loa[1]}] | {v['mae_bpm']} | "
+                     f"{v['within_tol_rate']} (CI {wci[0]}–{wci[1]}) | ±{v['tol_bpm']} |")
+        L.append("\n_Bias = mean(system − reference); LoA = bias ± 1.96·SD (the band 95% of "
+                 "differences fall within). A small bias with wide LoA still means poor "
+                 "per-reading agreement._\n")
+
     L.append("---")
     L.append("> **Read honestly.** This is *one* session in *one* room. A defensible accuracy "
              "claim requires the ADR-151 protocol: ≥3 environments, ≥N subjects, held-out / "
@@ -250,19 +346,30 @@ def main():
     ap.add_argument("--json", default="metrics.json")
     ap.add_argument("--offset", type=float, default=0.0, help="seconds added to system timestamps")
     ap.add_argument("--event-tolerance", type=float, default=120.0)
+    ap.add_argument("--vitals-ref", default=None,
+                    help="vitalsref.jsonl from reference.py → Bland–Altman HR/BR agreement")
+    ap.add_argument("--vitals-tolerance", type=float, default=5.0, help="±BPM agreement band")
+    ap.add_argument("--vitals-window", type=float, default=5.0,
+                    help="max seconds between a reference and a system sample to pair them")
     args = ap.parse_args()
 
-    sys_presence, sys_events = load_session(args.session, args.offset)
+    sys_presence, sys_events, sys_vitals = load_session(args.session, args.offset)
     truth_toggles, truth_events = load_truth(args.truth)
     presence = score_presence(sys_presence, truth_toggles)
     events = score_events(sys_events, truth_events, args.event_tolerance)
+    vitals = {}
+    if args.vitals_ref:
+        vitals = score_vitals(sys_vitals, load_vitals_ref(args.vitals_ref),
+                              args.vitals_tolerance, args.vitals_window)
 
     meta = {"session": args.session, "truth": args.truth, "offset": args.offset}
-    report = render(presence, events, meta)
+    if args.vitals_ref:
+        meta["vitals_ref"] = args.vitals_ref
+    report = render(presence, events, vitals, meta)
     with open(args.out, "w") as f:
         f.write(report)
     with open(args.json, "w") as f:
-        json.dump({"presence": presence, "events": events, "meta": meta}, f, indent=2)
+        json.dump({"presence": presence, "events": events, "vitals": vitals, "meta": meta}, f, indent=2)
 
     sys.stdout.write(report)
     print(f"\n[score] wrote {args.out} + {args.json}", file=sys.stderr)
