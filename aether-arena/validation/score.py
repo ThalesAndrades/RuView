@@ -80,7 +80,9 @@ def load_vitals_ref(path):
             if not line:
                 continue
             rec = json.loads(line)
-            m = rec.get("metric", "hr")
+            if "metric" not in rec:
+                raise ValueError(f"vitals-ref record missing 'metric' field: {rec}")
+            m = rec["metric"]
             ref.setdefault(m, []).append((float(rec["t"]), float(rec["value"])))
     for m in ref:
         ref[m].sort()
