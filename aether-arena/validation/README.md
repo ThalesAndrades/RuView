@@ -1,4 +1,4 @@
-# RuView field-validation harness (ADR-151 P1)
+# RuView field-validation harness (ADR-151 P1 + P2)
 
 Measure the semantic layer's **accuracy against ground truth**, instead of
 trusting demos. This is the **Capture → Align → Score** pipeline from
@@ -8,8 +8,9 @@ stdlib — no `pip install` (includes a minimal WebSocket client).
 | File | Role |
 |---|---|
 | `record.py` | Subscribe to the sensing-server `/ws/sensing` and log every `sensing_update` + `semantic_event` to `session.jsonl`. |
-| `mark.py` | Tier-A ground-truth marker — log timestamped `present`/`absent` toggles and point events (`bed_exit`, …) to `groundtruth.jsonl`. |
-| `score.py` | Align the two on wall-clock time → `report.md` + `metrics.json`: presence confusion (precision/recall/F1/false-alarm-rate/onset-latency, with **Wilson 95% CIs**) and event matching (TP/FP/FN + latency). |
+| `mark.py` | **Tier-A** ground-truth marker — a human logs timestamped `present`/`absent` toggles and point events (`bed_exit`, …) to `groundtruth.jsonl`. |
+| `reference.py` | **Tier-B** sensor converter (P2) — turn **independent reference sensors** into the same artifacts with *no human in the loop*: a bed load-cell → `bed_exit` events, a PIR/contact → presence toggles, a **Polar H10** → an HR `vitalsref.jsonl` oracle. |
+| `score.py` | Align everything on wall-clock time → `report.md` + `metrics.json`: presence confusion (precision/recall/F1/false-alarm-rate/onset-latency, with **Wilson 95% CIs**), event matching (TP/FP/FN + latency), and **vitals Bland–Altman** (HR/BR bias, 95% limits of agreement, within-±N-BPM rate) when `--vitals-ref` is given. |
 | `protocol.md` | How to run a session that yields *defensible* numbers (clocks, session script, sample-size calc, generalization axes). |
 
 ## 60-second smoke test (no hardware)
@@ -43,6 +44,38 @@ ESP32 hardware, mark transitions on a phone with `mark.py` (or wire Tier-B
 reference sensors — PIR / bed load-cell / Polar H10), and score. Report
 held-out / cross-subject / cross-environment **separately**, each with CIs —
 never a single in-room number.
+
+## Tier-B reference sensors (P2) — ground truth without a human
+
+A human pressing `mark.py` can't cover the **~50 overnight bed-exits** the power
+calc asks for. `reference.py` converts independent reference-sensor logs into the
+*same* `groundtruth.jsonl` / `vitalsref.jsonl` the scorer reads — so a multi-night
+run self-labels. Each sensor is an **oracle on its own log**, never derived from
+the system under test.
+
+```bash
+# Polar H10 chest strap → HR oracle for vitals scoring  (t,hr CSV)
+python reference.py polar_h10   --in polar.csv --out vitalsref.jsonl
+
+# Load-cell under the bed legs → bed_exit events + bed presence  (t,weight CSV)
+python reference.py bed_loadcell --in bed.csv   --out groundtruth.jsonl --threshold 10
+
+# PIR / door-contact → presence toggles  (t,motion 0/1 CSV)
+python reference.py pir          --in pir.csv   --out groundtruth.jsonl
+
+# score with the vitals oracle → adds a Bland–Altman HR/BR section
+python score.py --session session.jsonl --truth groundtruth.jsonl \
+    --vitals-ref vitalsref.jsonl --vitals-tolerance 5
+```
+
+Inputs accept epoch-seconds, epoch-ms, or ISO-8601 timestamps, and either a
+named-header CSV (`--tcol`/`--vcol`) or a positional `t,value` CSV. Outputs are
+appended, so several sensors populate one `groundtruth.jsonl`.
+
+The **vitals** section reports `bias` (mean system−reference), the **95% limits
+of agreement** (bias ± 1.96·SD — the band 95% of per-reading differences fall in),
+MAE, and the within-±N-BPM rate with a Wilson CI. A small bias with wide LoA still
+means poor per-reading agreement — read both.
 
 ## Honesty
 
